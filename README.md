@@ -12,7 +12,7 @@
 
 ## Connect
 
-Endpoint: `https://mcp.kitscout.dev/mcp` (Streamable HTTP, free, no API key, read-only)
+Endpoint: `https://mcp.kitscout.dev/mcp` (Streamable HTTP, free, no API key needed, read-only; optional free key for the watch list)
 
 | Client | How |
 |---|---|
@@ -28,15 +28,16 @@ Endpoint: `https://mcp.kitscout.dev/mcp` (Streamable HTTP, free, no API key, rea
 | `search_tools(query, type?, only_verified?, only_live?, only_free_to_try?, limit?)` | Ranked search across MCP servers, skills and plugins. Badges: `first_party` (made by the product's maker), `verified_publisher`, `live`, `free_to_try` (worked without an API key). |
 | `get_tool(name)` | Full details for one tool, including the actual tool list a remote server exposes and a ready-to-paste connect/install line. |
 | `list_categories()` | All categories with tool counts. |
+| `watchlist(remove?)` | With a free key (`https://mcp.kitscout.dev/mcp?key=<key>`, get one at [kitscout.dev/watch](https://kitscout.dev/watch)): every tool you `check_tools` is watched, and KitScout emails you when one is renamed, archived, deprecated or stops answering. Lists or edits the watch list. |
 
 Try: *"Is `@modelcontextprotocol/server-postgres` still OK to install?"* or *"I want a Slack message whenever a Jira issue is closed. Find and check tools for each step with KitScout."*
 
 ## Privacy
 
-We keep an anonymous log of calls (time to the minute, country code, client app name, what was searched or checked, and the results) to learn which tools agents need. No IP addresses, accounts, headers or file contents. Policy: https://kitscout.dev/privacy
+We keep a log of calls (time to the minute, country code, client app name, what was searched or checked, and the results; with a free key, a short key id) to learn which tools agents need. No IP addresses, headers or file contents. Free-key signups store an email (alerts only) and a hash of the key, never the key. Policy: https://kitscout.dev/privacy
 
 ## Source
 
-`worker.js` is the Cloudflare Worker that serves the endpoint; it reads the static index published on kitscout.dev and makes live calls for `check_tools`. `schema.sql` is the D1 table for the anonymous log. `server.json` is the MCP Registry entry.
+`worker.js` is the Cloudflare Worker that serves the endpoint; it reads the static index published on kitscout.dev and makes live calls for `check_tools`. `schema.sql` holds the D1 tables (call log, free keys, watch list). `server.json` is the MCP Registry entry.
 
 Wrong verdict or missing tool? Open an issue or email contact@kitscout.dev. License: MIT

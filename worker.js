@@ -7,7 +7,7 @@ const CH = 500;
 const KIND = { 0: "skill", 1: "mcp", 2: "plugin" };
 const TAG = { v: "first_party", o: "verified_publisher", l: "live", f: "free_to_try" };
 const INSTRUCTIONS = `KitScout indexes ~88,000 AI agent tools: MCP servers (official MCP Registry and GitHub), Agent Skills (GitHub SKILL.md) and Claude Code plugins, with GitHub activity, publisher identity and a daily live check of every remote MCP server (live = answers, some need sign-in; free_to_try = a read-only call worked with no API key).
-Tools: search_tools finds tools by product or task keywords; get_tool returns details, install or connect lines and a remote server's tool list; check_tools verifies tools the user already has in mind (maker, maintenance, adoption, live status, alternatives); list_categories lists categories. first_party = made by the product's own maker; verified_publisher = domain-verified publisher. Stars for Agent Skills are their repo's stars.`;
+Tools: search_tools finds tools by product or task keywords; get_tool returns details, install or connect lines and a remote server's tool list; check_tools verifies tools the user already has in mind (maker, maintenance, adoption, live status, alternatives); list_categories lists categories; watchlist shows the user's watched tools (with a free key from kitscout.dev/watch, tools passed to check_tools are watched and the user gets an email when one is renamed, archived, deprecated or stops answering). first_party = made by the product's own maker; verified_publisher = domain-verified publisher. Stars for Agent Skills are their repo's stars.`;
 
 // every index file is fetched with ?v=<build id> so a daily rebuild never mixes old shards with new meta (indices shift between builds)
 let VER = { v: "", at: 0 };
@@ -323,6 +323,10 @@ async function checkOne(raw, cats, arch) {
   }
   if (repo && arch && arch.includes(repo.toLowerCase())) facts.archived = true;
   // verdict
+  // deprecation that only says "moved to <pkg>" = renamed, not abandoned (2026-11-15: openflowkit)
+  const mv = facts.deprecated && facts.deprecated.match(/\b(?:moved|renamed|migrated|published)\s+(?:to|as)\s+(@?[\w.-]+(?:\/[\w.-]+)?)/i);
+  const moved = mv && !/retired|unsupported|unmaintained|no longer|archived/i.test(facts.deprecated) ? mv[1].replace(/[.]+$/, "") : null;
+  if (moved) { facts.moved_to = moved; delete facts.deprecated; }
   if (facts.deprecated) reasons.push("npm package is deprecated by its maker: " + facts.deprecated);
   if (facts.archived) reasons.push("repository is archived (no longer maintained)");
   // input was a repo (= the code): a hosted endpoint of it being down is a note, not a reason to avoid the code (2026-11-15: metabase, marmot)
@@ -332,7 +336,9 @@ async function checkOne(raw, cats, arch) {
   if (facts.last_push_days > 730) reasons.push(`no code changes for ${facts.last_push_days} days (abandoned)`);
   else if (facts.last_push_days > 365) reasons.push(`no code changes for ${facts.last_push_days} days: may be finished or unmaintained`);
   else if (facts.last_push_days > 180) reasons.push(`slow maintenance: last change ${facts.last_push_days} days ago`);
-  if ((facts.stars ?? 0) < 10 && !facts.first_party && !facts.deprecated && facts.stars != null) reasons.push(`little adoption (${facts.stars ?? 0} GitHub stars) and not made by the product's maker`);
+  const vettedPlugin = facts.type === "plugin" && facts.verified_publisher;  // listed in Anthropic's reviewed marketplace: stars of a tiny plugin repo say little
+  if (moved) reasons.push(`package moved: use ${moved} instead`);
+  if ((facts.stars ?? 0) < 10 && !facts.first_party && !facts.deprecated && !vettedPlugin && facts.stars != null) reasons.push(`little adoption (${facts.stars ?? 0} GitHub stars) and not made by the product's maker`);
   if (!a && !repo && !k.url && !facts.deprecated && !npmFound) reasons.push("not found in KitScout (88k tools) — check the exact name, repo URL or package id");
   if (!res.verdict) res.verdict = (facts.archived || facts.deprecated || (liveFail && !codeInput) || facts.last_push_days > 730) ? "avoid" : reasons.length ? "caution" : "ok";
   if (res.verdict === "ok" && facts.first_party) reasons.push("made by the product's own company");
@@ -352,6 +358,66 @@ async function checkTools(args) {
   if (!list.length) return { error: "Pass tools: a list of repo URLs, package ids (npm/pypi), remote MCP URLs or names." };
   const [cats, arch] = await Promise.all([jget("s/cats.json"), jget("s/arch.json")]);
   return { checked: await Promise.all(list.map(x => checkOne(x, cats, arch))), note: "verdict: ok / caution / avoid. live_now = we called the remote server during this check." };
+}
+
+// ---- Free key + watch list (kitscout.dev/watch). Key itself is never stored: only sha256 (khash) and its first 12 hex (kid).
+const WATCH_MAX = 25;
+const WATCH_URL = SITE + "watch";
+async function sha256hex(s) { const b = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s)); return [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, "0")).join(""); }
+async function keyId(req, url, env) {
+  const auth = req.headers.get("authorization") || "";
+  const k = (url.searchParams.get("key") || (auth.match(/^Bearer\s+(ks_[0-9a-f]{32})$/i) || [])[1] || "").trim();
+  if (!/^ks_[0-9a-f]{32}$/.test(k) || !env || !env.LOG) return null;
+  const row = await env.LOG.prepare("SELECT kid FROM subs WHERE khash = ? AND status = 'active'").bind(await sha256hex(k)).first().catch(() => null);
+  return row ? row.kid : null;
+}
+const nowMin = () => new Date().toISOString().slice(0, 16);
+async function watchAdd(env, kid, items) {  // items: [{tool, verdict}]; returns {watching, max, skipped}
+  const have = new Set(((await env.LOG.prepare("SELECT tool FROM watch WHERE kid = ?").bind(kid).all()).results || []).map(r => r.tool));
+  const ts = nowMin(), stmts = [];
+  let skipped = 0;
+  for (const it of items) {
+    const t = String(it.tool || "").trim().slice(0, 200);
+    if (!t) continue;
+    if (!have.has(t) && have.size >= WATCH_MAX) { skipped++; continue; }
+    have.add(t);
+    stmts.push(env.LOG.prepare("INSERT INTO watch (kid, tool, verdict, added, checked) VALUES (?,?,?,?,?) ON CONFLICT(kid, tool) DO UPDATE SET verdict = COALESCE(excluded.verdict, watch.verdict), checked = COALESCE(excluded.checked, watch.checked)")
+      .bind(kid, t, it.verdict || null, ts, it.verdict ? ts : null));
+  }
+  if (stmts.length) await env.LOG.batch(stmts);
+  return { watching: have.size, max: WATCH_MAX, skipped };
+}
+async function watchlist(args, env, kid) {
+  if (!kid) return { error: `No KitScout key on this connection. Get a free key at ${WATCH_URL} and connect with https://mcp.kitscout.dev/mcp?key=<your key>. Then every tool you check is watched, and you get an email when one is renamed, archived, deprecated or stops answering.` };
+  const rm = (Array.isArray(args.remove) ? args.remove : args.remove ? [args.remove] : []).map(String).slice(0, WATCH_MAX);
+  if (rm.length) await env.LOG.batch(rm.map(t => env.LOG.prepare("DELETE FROM watch WHERE kid = ? AND tool = ?").bind(kid, t)));
+  const rows = (await env.LOG.prepare("SELECT tool, verdict, added, checked FROM watch WHERE kid = ? ORDER BY added").bind(kid).all()).results || [];
+  return { watching: rows.map(r => ({ tool: r.tool, last_verdict: r.verdict || "not checked yet", added: r.added, last_checked: r.checked })), count: rows.length, max: WATCH_MAX,
+    note: "Tools are added automatically when you check_tools with this key. We email you when a watched tool is renamed, archived, deprecated or stops answering (weekly digest, free during early access)." };
+}
+
+const EMAIL_RE = /^[^\s@<>",;]{1,64}@[^\s@<>",;]{1,253}\.[A-Za-z]{2,}$/;
+async function signup(req, env) {
+  const ct = req.headers.get("content-type") || "";
+  let f = {};
+  try { f = ct.includes("json") ? await req.json() : Object.fromEntries(await req.formData()); } catch { f = {}; }
+  const html = !ct.includes("json");
+  const reply = (obj, status = 200) => html
+    ? new Response(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>KitScout key</title><body style="font:16px/1.6 system-ui;max-width:640px;margin:40px auto;padding:0 16px">${obj.error ? `<p>${obj.error}</p>` : `<h1>Your KitScout key</h1><p>Save it now; we cannot show it again.</p><p><code style="word-break:break-all">${obj.key}</code></p><p>Connect: <code style="word-break:break-all">${obj.mcp_url}</code></p>`}<p><a href="${WATCH_URL}">Back to KitScout</a></p>`, { status, headers: { "content-type": "text/html; charset=utf-8", ...CORS } })
+    : Response.json(obj, { status, headers: CORS });
+  if (f.website) return reply({ error: "Rejected." }, 400);  // honeypot field, invisible to people
+  const email = String(f.email || "").trim().toLowerCase();
+  if (email.length > 254 || !EMAIL_RE.test(email)) return reply({ error: "Please enter a valid email address." }, 400);
+  if (!env || !env.LOG) return reply({ error: "Signup is temporarily unavailable." }, 503);
+  const rnd = crypto.getRandomValues(new Uint8Array(16));
+  const key = "ks_" + [...rnd].map(x => x.toString(16).padStart(2, "0")).join("");
+  const khash = await sha256hex(key), kid = khash.slice(0, 12);
+  const pro = ["1", "true", "on", "yes"].includes(String(f.pro || "").toLowerCase()) ? 1 : 0;
+  await env.LOG.prepare("INSERT INTO subs (kid, khash, email, ts, source, pro, country, status) VALUES (?,?,?,?,?,?,?, 'active')")
+    .bind(kid, khash, email, nowMin(), String(f.source || "web").slice(0, 40), pro, (req.cf && req.cf.country) || "").run();
+  const tools = String(f.tools || "").split(/[\n,]+/).map(x => x.trim()).filter(Boolean).slice(0, WATCH_MAX);
+  const w = tools.length ? await watchAdd(env, kid, tools.map(t => ({ tool: t }))) : { watching: 0, max: WATCH_MAX };
+  return reply({ key, mcp_url: `https://mcp.kitscout.dev/mcp?key=${key}`, watching: w.watching, max: WATCH_MAX });
 }
 
 const TOOLS = [
@@ -389,6 +455,12 @@ const TOOLS = [
     inputSchema: { type: "object", properties: {} },
     annotations: { title: "List categories", readOnlyHint: true, openWorldHint: false },
   },
+  {
+    name: "watchlist",
+    description: "Your KitScout watch list (needs a free key: connect with https://mcp.kitscout.dev/mcp?key=<key>, get one at kitscout.dev/watch). Tools you check_tools with a key are added automatically; KitScout emails you when one is renamed, archived, deprecated or stops answering. Shows each watched tool with its last verdict; pass remove to stop watching tools.",
+    inputSchema: { type: "object", properties: { remove: { type: "array", items: { type: "string" }, description: "Tool names or URLs to stop watching (as listed)" } } },
+    annotations: { title: "My watched tools", readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+  },
 ];
 
 // Anonymous demand log (policy: https://kitscout.dev/privacy). Stored in D1 `kitscout-log`: time, country, client product name,
@@ -399,7 +471,7 @@ const clientOf = (req, params) => {
   const ua = req.headers.get("user-agent") || "";
   return (ua.match(/^[A-Za-z][\w.-]{0,39}(\/[\w.-]{0,15})?/) || [""])[0];  // product token only, e.g. "claude-code/2.1.0"
 };
-function logRow(env, ctx, req, method, params, data) {
+function logRow(env, ctx, req, method, params, data, kid) {
   if (!env || !env.LOG) return;
   const a = (params && params.arguments) || {};
   const tool = method === "tools/call" ? String(params.name || "").slice(0, 40) : method;
@@ -407,28 +479,33 @@ function logRow(env, ctx, req, method, params, data) {
   const filters = ["type", "only_official", "only_live", "only_free_to_try", "limit"].filter(k => a[k] !== undefined).map(k => k + "=" + a[k]).join(",");
   const res = data && data.results ? data.results.map(r => r.name).slice(0, 10) : data && data.checked ? data.checked.map(c => `${c.name || c.input}:${c.verdict}`) : data && data.name ? [data.name] : [];
   const n = data && (data.total_matches ?? (data.error ? 0 : data.name ? 1 : null));
-  ctx.waitUntil(env.LOG.prepare("INSERT INTO q (ts, country, client, tool, query, filters, n, results) VALUES (?,?,?,?,?,?,?,?)")
-    .bind(new Date().toISOString().slice(0, 16), (req.cf && req.cf.country) || "", clientOf(req, params), tool, q, filters, n ?? null, JSON.stringify(res))
+  ctx.waitUntil(env.LOG.prepare("INSERT INTO q (ts, country, client, tool, query, filters, n, results, kid) VALUES (?,?,?,?,?,?,?,?,?)")
+    .bind(new Date().toISOString().slice(0, 16), (req.cf && req.cf.country) || "", clientOf(req, params), tool, q, filters, n ?? null, JSON.stringify(res), kid || null)
     .run().catch(() => {}));
 }
 
-async function handle(msg, req, env, ctx) {
+async function handle(msg, req, env, ctx, kid) {
   const { id, method, params = {} } = msg;
   const ok = result => ({ jsonrpc: "2.0", id, result });
   const err = (code, message) => ({ jsonrpc: "2.0", id, error: { code, message } });
   if (method === "initialize") {
     const v = VERSIONS.includes(params.protocolVersion) ? params.protocolVersion : VERSIONS[1];
-    logRow(env, ctx, req, method, params, null);
+    logRow(env, ctx, req, method, params, null, kid);
     return ok({ protocolVersion: v, capabilities: { tools: { listChanged: false } }, serverInfo: { name: "kitscout", title: "KitScout", version: "1.0.0", websiteUrl: SITE }, instructions: INSTRUCTIONS });
   }
   if (method === "ping") return ok({});
   if (method === "tools/list") return ok({ tools: TOOLS });
   if (method === "tools/call") {
-    const fn = { search_tools: searchTools, get_tool: getTool, check_tools: checkTools, list_categories: listCategories }[params.name];
+    const fn = { search_tools: searchTools, get_tool: getTool, check_tools: checkTools, list_categories: listCategories, watchlist: a => watchlist(a, env, kid) }[params.name];
     if (!fn) return err(-32602, "Unknown tool: " + params.name);
     try {
       const data = await fn(params.arguments || {});
-      logRow(env, ctx, req, method, params, Array.isArray(data) ? null : data);
+      if (params.name === "check_tools" && data.checked) {
+        if (kid) data.watchlist = { ...(await watchAdd(env, kid, data.checked.map(c => ({ tool: c.name || c.input, verdict: c.verdict })))),
+          note: "Watched: we email you if any of these is renamed, archived, deprecated or stops answering." };
+        else data.watch_hint = `Want an email when any of these tools is renamed, archived, deprecated or goes down? Free key: ${WATCH_URL}`;
+      }
+      logRow(env, ctx, req, method, params, Array.isArray(data) ? null : data, kid);
       return ok({ content: [{ type: "text", text: JSON.stringify(data, null, 1) }], structuredContent: Array.isArray(data) ? { categories: data } : data, isError: !!data.error });
     } catch (e) {
       return ok({ content: [{ type: "text", text: "KitScout error: " + String(e).slice(0, 200) }], isError: true });
@@ -443,21 +520,24 @@ const LANDING = `<!doctype html><meta charset="utf-8"><meta name="viewport" cont
 <h1>KitScout MCP server</h1><p>Lets your AI agent search ~88,000 MCP servers, Agent Skills and Claude Code plugins on <a href="${SITE}">kitscout.dev</a>, with live checks and install lines. Free, read-only, no key.</p>
 <p><b>Claude Code:</b> <code>claude mcp add --transport http kitscout https://mcp.kitscout.dev/mcp</code></p>
 <p><b>Claude app:</b> Settings → Connectors → Add custom connector → <code>https://mcp.kitscout.dev/mcp</code></p>
-<p>Tools: search_tools, get_tool, list_categories. Contact: contact@kitscout.dev</p>
-<p>Privacy: we keep an anonymous log of searches (keywords, results, country, client app name) to learn which tools agents need. No IPs, accounts or file contents. <a href="${SITE}privacy">Data policy</a></p>`;
+<p>Tools: check_tools, search_tools, get_tool, list_categories, watchlist. Contact: contact@kitscout.dev</p>
+<p><b>Optional free key:</b> <a href="${WATCH_URL}">get one</a> and connect with <code>https://mcp.kitscout.dev/mcp?key=&lt;key&gt;</code>. Every tool you check is then watched, and we email you when one is renamed, archived, deprecated or stops answering.</p>
+<p>Privacy: we keep a log of calls (keywords, results, country, client app name; with a key, a short key id) to learn which tools agents need. No IPs or file contents. <a href="${SITE}privacy">Data policy</a></p>`;
 
 export default {
   async fetch(req, env, ctx) {
     ENV = env || {};
     const url = new URL(req.url);
     if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
+    if (url.pathname === "/signup" && req.method === "POST") return signup(req, env);
     if (url.pathname !== "/mcp") return new Response(LANDING, { headers: { "content-type": "text/html; charset=utf-8" } });
     if (req.method === "GET") return new Response("Use POST (Streamable HTTP, JSON responses).", { status: 405, headers: { Allow: "POST", ...CORS } });
     if (req.method !== "POST") return new Response(null, { status: 405, headers: CORS });
     let body;
     try { body = await req.json(); } catch { return Response.json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }, { status: 400, headers: CORS }); }
     const msgs = Array.isArray(body) ? body : [body];
-    const out = (await Promise.all(msgs.filter(m => m && m.id !== undefined && m.method).map(m => handle(m, req, env, ctx))));
+    const kid = await keyId(req, url, env);
+    const out = (await Promise.all(msgs.filter(m => m && m.id !== undefined && m.method).map(m => handle(m, req, env, ctx, kid))));
     if (!out.length) return new Response(null, { status: 202, headers: CORS });
     return Response.json(Array.isArray(body) ? out : out[0], { headers: CORS });
   },
