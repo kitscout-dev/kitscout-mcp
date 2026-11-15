@@ -9,7 +9,28 @@ CREATE TABLE IF NOT EXISTS q (
   query TEXT,              -- search keywords or requested tool name
   filters TEXT,            -- e.g. type=mcp,only_live=true
   n INTEGER,               -- total matches (search) / 1|0 (get_tool)
-  results TEXT             -- JSON array: top result names shown (max 10)
+  results TEXT,            -- JSON array: top result names shown (max 10)
+  kid TEXT                 -- key id (first 12 hex of sha256(key)) when the call used a free key, else NULL
 );
 CREATE INDEX IF NOT EXISTS q_ts ON q (ts);
 CREATE INDEX IF NOT EXISTS q_tool ON q (tool, ts);
+
+-- Free keys (kitscout.dev/watch). The key itself is never stored.
+CREATE TABLE IF NOT EXISTS subs (
+  kid TEXT PRIMARY KEY,         -- first 12 hex of sha256(key)
+  khash TEXT NOT NULL UNIQUE,   -- sha256 hex of the key
+  email TEXT NOT NULL,          -- for watch alerts only; deletion on request (contact@kitscout.dev)
+  ts TEXT NOT NULL,             -- UTC minute
+  source TEXT,                  -- page/channel the signup came from
+  pro INTEGER DEFAULT 0,        -- 1 = ticked 'I would pay for Pro' (demand signal, no charge)
+  country TEXT,
+  status TEXT DEFAULT 'active'  -- active | deleted
+);
+CREATE INDEX IF NOT EXISTS subs_email ON subs (email);
+CREATE TABLE IF NOT EXISTS watch (
+  kid TEXT NOT NULL,
+  tool TEXT NOT NULL,           -- name or URL as checked/entered
+  verdict TEXT,                 -- last check_tools verdict ok|caution|avoid
+  added TEXT, checked TEXT,
+  PRIMARY KEY (kid, tool)
+);
