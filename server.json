@@ -2,8 +2,8 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "dev.kitscout/kitscout",
   "title": "KitScout",
-  "description": "Find MCP servers, Agent Skills and Claude Code plugins: 84k tools, daily live checks, install lines.",
-  "version": "1.0.0",
+  "description": "Check MCP servers, skills and plugins before installing: maker, upkeep, live status. 88k tools.",
+  "version": "1.0.1",
   "websiteUrl": "https://kitscout.dev",
   "remotes": [
     {

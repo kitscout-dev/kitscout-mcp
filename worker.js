@@ -6,7 +6,7 @@ const VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const CH = 500;
 const KIND = { 0: "skill", 1: "mcp", 2: "plugin" };
 const TAG = { v: "first_party", o: "verified_publisher", l: "live", f: "free_to_try" };
-const INSTRUCTIONS = `KitScout indexes ~88,000 AI agent tools: MCP servers (official MCP Registry and GitHub), Agent Skills (GitHub SKILL.md) and Claude Code plugins, with GitHub activity, publisher identity and a daily live check of every remote MCP server (live = answers; free_to_try = a read-only call worked with no API key).
+const INSTRUCTIONS = `KitScout indexes ~88,000 AI agent tools: MCP servers (official MCP Registry and GitHub), Agent Skills (GitHub SKILL.md) and Claude Code plugins, with GitHub activity, publisher identity and a daily live check of every remote MCP server (live = answers, some need sign-in; free_to_try = a read-only call worked with no API key).
 Tools: search_tools finds tools by product or task keywords; get_tool returns details, install or connect lines and a remote server's tool list; check_tools verifies tools the user already has in mind (maker, maintenance, adoption, live status, alternatives); list_categories lists categories. first_party = made by the product's own maker; verified_publisher = domain-verified publisher. Stars for Agent Skills are their repo's stars.`;
 
 // every index file is fetched with ?v=<build id> so a daily rebuild never mixes old shards with new meta (indices shift between builds)
@@ -76,7 +76,7 @@ async function rank(q) {
       const ex = k === t || k === o; if (!ex && !(t.length >= 4 && k.startsWith(t))) continue;
       for (const c of codes) { const w = ((c >> 9) & 3) * (ex ? 1 : 0.85), i = c >>> 11; if ((best.get(i) || [0])[0] < w) best.set(i, [w, c]); }
     }
-    for (const [i, [w, c]] of best) { const x = sc.get(i) || { n: 0, w: 0, c, t: new Set() }; x.n++; x.w += w; x.t.add(t); sc.set(i, x); }
+    for (const [i, [w, c]] of best) { const x = sc.get(i) || { n: 0, w: 0, c, t: new Set(), nt: new Set() }; x.n++; x.w += w; x.t.add(t); if (w >= 2) x.nt.add(t); sc.set(i, x); }
   });
   const { mem, req } = await intentMembers(T, sc);
   const tot = [...idf.values()].reduce((a, b) => a + b, 0) || 1, L = T.length;
@@ -85,9 +85,15 @@ async function rank(q) {
     let s = 10 * L * cov + o.w + b * 0.3;
     if (mem.has(i)) s = 10 * L * (0.6 + 0.4 * cov) * (o.inj ? 0.85 : 1) + Math.min(o.w, L) + 1.2 * b + 3;
     else if (mem.size) s *= 0.9;
-    return { i, c: o.c, s, cov, m: mem.has(i), t: o.t };
+    return { i, c: o.c, s, cov, m: mem.has(i), t: o.t, nt: o.nt || new Set() };
   });
   const full = R.filter(r => r.cov >= 0.75 || (r.m && [...req].every(t => r.t.has(t)))); if (full.length) R = full;
+  // product words are required whenever any result has them ('slack post message' must not return Telegram/LINE; dogfood 2026-11-15)
+  const [CI, B0, PW] = await Promise.all([jget("s/ci.json"), jget("s/b.json"), jget("s/pw.json")]), pw = new Set(PW || []);
+  const need = T.filter(([t, o]) => (B0 && (B0[t] || B0[o])) || pw.has(t) || ((CI && (CI.t[t] || CI.t[o])) || [0, 0, 0])[2] >= 0.4).map(([t]) => t);
+  if (need.length && T.length > need.length) { const bm = t => new Set((B0 && B0[t]) || []);  // the maker's own tools count even without the word in their name (jira -> Atlassian Rovo)
+    // platform words must be in the NAME (a description that mentions Slack is not a Slack tool); other product words anywhere
+    const R2 = R.filter(r => need.every(t => r.nt.has(t) || bm(t).has(r.i) || (!pw.has(t) && r.t.has(t)))); if (R2.length) R = R2; }
   const B = (await jget("s/b.json")) || {}, vb = new Set(T.flatMap(([t, o]) => [...(B[t] || []), ...(B[o] || [])]));
   for (const r of R) if (vb.has(r.i)) r.s += 8;
   return R.sort((a, b) => b.s - a.s);
@@ -169,6 +175,8 @@ function keyOf(raw) {
 async function lookup(k) { const sh = await jget(`s/k/${(await md5hex(k)).slice(0, 2)}.json`); return (sh && sh[k]) || []; }
 async function extra(i) { const e = await jget(`s/e${Math.floor(i / CH)}.json`); return (e && e[i % CH]) || []; }
 async function probe(url) {  // live MCP initialize right now (5 s)
+  // a Worker fetching its own zone gets Cloudflare 523 -> checking KitScout itself must not say 'avoid' (dogfood 2026-11-15)
+  if (/^https?:\/\/(mcp\.)?kitscout\.dev(\/|$)/i.test(url)) return "answers (KitScout itself; this check is running on it)";
   try {
     const r = await fetch(url, { method: "POST", headers: { "content-type": "application/json", accept: "application/json, text/event-stream" }, signal: AbortSignal.timeout(5000),
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "kitscout-check", version: "1" } } }) });
@@ -188,7 +196,8 @@ async function alternativesFor(name, desc, kindCode, myBits, selfIdx, cats, only
   // same job = search with the candidate's own name + description words; better = same kind, clearly higher quality prior
   const clean = t => [...new Set((String(t).toLowerCase().match(/[a-z0-9]+/g) || []).filter(w => w.length > 2 && !GENERIC.has(w)))];
   let words = clean(String(name).replace(/^.*\//, ""));  // the tool's own name says what it is for ('google-sheets-mcp')
-  words = [...new Set([...words, ...clean(desc).slice(0, 2)])].slice(0, 4);  // name + what the description says it does
+  const nameWords = words.slice();
+  words = [...new Set([...words, ...clean(desc || "").slice(0, 2)])].slice(0, 4);  // desc may be undefined (not in KitScout, no repo) -> was matching the word "undefined"  // name + what the description says it does
   const q = words.slice(0, 4).join(" ");
   if (!q) return [];
   const B = (await jget("s/b.json")) || {};
@@ -196,7 +205,11 @@ async function alternativesFor(name, desc, kindCode, myBits, selfIdx, cats, only
   const official = [...new Set(words.flatMap(w => B[st(w)] || []))].filter(j => j !== selfIdx && inR.has(j)).slice(0, 2);  // the maker's own tool first (must fit the job)
   const R = RR.filter(r => r.i !== selfIdx && !official.includes(r.i) && ((r.c >> 3) & 3) === kindCode && ((r.c >> 5) & 15) >= myBits + 2).slice(0, 3 - official.length);
   const metas = await Promise.all([...official, ...R.map(r => r.i)].map(meta));
-  return metas.map((m, n) => m && { ...shape(m, cats), why: n < official.length ? "official: made by the product's maker" : "same job, more adopted / better maintained" })
+  // 2026-11-15 workflow A/B: rank() alone returned off-topic 'alternatives' (job scraper -> kubb OpenAPI codegen). An alternative must
+  // itself say it does the job: >= min(2, n) of the query words in its own name + description. No alternative beats a wrong one.
+  // name words carry the job ('postgres', 'google sheets'); description words are often filler ('interacting') -> require a name word when we have one
+  const fits = m => { const t = new Set(clean(m[0] + " " + (m[5] || ""))); return nameWords.length ? nameWords.some(w => t.has(w)) : words.filter(w => t.has(w)).length >= Math.min(2, words.length); };
+  return metas.map((m, n) => m && fits(m) && { ...shape(m, cats), why: n < official.length ? "official: made by the product's maker" : "same job, more adopted / better maintained" })
     .filter(Boolean).filter(x => onlyOfficial ? x.why.startsWith("official") : true)
     .map(x => ({ name: x.name, why: x.why, badges: x.badges, stars: x.stars ?? x.repo_stars, install: x.install, page: x.page }));
 }
@@ -243,16 +256,27 @@ async function checkOne(raw, cats, arch) {
     Object.assign(facts, { type: sh.type, category: sh.category, first_party: a[7].includes("v"), verified_publisher: a[7].includes("o"), runs: sh.runs, install: sh.install });
   }
   if (!a && k.url) facts.live_now = await probe(k.url);
+  // npm deprecation = the maker says stop using it (e.g. @modelcontextprotocol/server-postgres). 1 subrequest.
+  const npmName = (/^@[\w.-]+\/[\w.-]+$/.test(String(raw).trim().replace(/^(npx|npm i|npm install)\s+(-y\s+)?/i, "").replace(/^npm:/i, "").replace(/(?<=.)@[^/@]*$/, "")) && String(raw).trim().replace(/^(npx|npm i|npm install)\s+(-y\s+)?/i, "").replace(/^npm:/i, "").replace(/(?<=.)@[^/@]*$/, ""))
+    || (facts.install && /^npm:/.test(facts.install) ? facts.install.slice(4).replace(/(?<=.)@[^/@]*$/, "") : null);
+  if (npmName) {
+    const r = await fetch("https://registry.npmjs.org/" + npmName.replace("/", "%2f") + "/latest", { cf: { cacheTtl: 3600 } }).catch(() => null);
+    const j = r && r.ok ? await r.json().catch(() => null) : null;
+    if (j && j.deprecated) facts.deprecated = String(j.deprecated).slice(0, 200);
+    if (j && !res.name) res.name = j.name;
+    if (j && !facts.description && j.description) facts.description = String(j.description).slice(0, 200);
+  }
   if (repo && arch && arch.includes(repo.toLowerCase())) facts.archived = true;
   // verdict
+  if (facts.deprecated) reasons.push("npm package is deprecated by its maker: " + facts.deprecated);
   if (facts.archived) reasons.push("repository is archived (no longer maintained)");
   if (facts.live_now && facts.live_now.startsWith("no answer")) reasons.push("remote server did not answer just now");
   if (facts.live_now && facts.live_now.startsWith("HTTP")) reasons.push("remote server returned " + facts.live_now);
   if (facts.last_push_days > 365) reasons.push(`no code changes for ${facts.last_push_days} days`);
   else if (facts.last_push_days > 180) reasons.push(`slow maintenance: last change ${facts.last_push_days} days ago`);
-  if ((facts.stars ?? 0) < 10 && !facts.first_party) reasons.push(`little adoption (${facts.stars ?? 0} GitHub stars) and not made by the product's maker`);
-  if (!a && !repo && !k.url) reasons.push("not found in KitScout (88k tools) — check the exact name, repo URL or package id");
-  if (!res.verdict) res.verdict = (facts.archived || (facts.live_now || "").startsWith("no answer") || (facts.live_now || "").startsWith("HTTP 5") || facts.last_push_days > 365) ? "avoid" : reasons.length ? "caution" : "ok";
+  if ((facts.stars ?? 0) < 10 && !facts.first_party && !facts.deprecated && facts.stars != null) reasons.push(`little adoption (${facts.stars ?? 0} GitHub stars) and not made by the product's maker`);
+  if (!a && !repo && !k.url && !facts.deprecated) reasons.push("not found in KitScout (88k tools) — check the exact name, repo URL or package id");
+  if (!res.verdict) res.verdict = (facts.archived || facts.deprecated || (facts.live_now || "").startsWith("no answer") || (facts.live_now || "").startsWith("HTTP 5") || facts.last_push_days > 365) ? "avoid" : reasons.length ? "caution" : "ok";
   if (res.verdict === "ok" && facts.first_party) reasons.push("made by the product's own company");
   res.reasons = reasons; res.facts = facts;
   if (res.verdict !== "ok" || !facts.first_party) {
@@ -282,7 +306,7 @@ const TOOLS = [
         type: { type: "string", enum: ["mcp", "skill", "plugin"], description: "Only this kind of tool" },
         only_verified: { type: "boolean", description: "Only verified publishers (domain-verified registry namespace, Anthropic marketplace). Does not mean made by the product's vendor; see the first_party badge" },
         only_official: { type: "boolean", description: "Deprecated alias of only_verified" },
-        only_live: { type: "boolean", description: "Only remote MCP servers that answered our latest daily check" },
+        only_live: { type: "boolean", description: "Only remote MCP servers that answered our latest daily check (including ones that answer with a sign-in/OAuth request)" },
         only_free_to_try: { type: "boolean", description: "Only remote MCP servers that worked without an API key" },
         limit: { type: "integer", minimum: 1, maximum: 25, description: "Max results (default 10)" },
       },
