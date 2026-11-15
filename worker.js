@@ -38,24 +38,55 @@ async function qterms(q) {
   return [...out];
 }
 
-// same ranking as the site: AND-first, exact token 1.0 / prefix 0.85, name weight 3 vs description 1, plus quality prior
+// ranking v3 (2026-11-15, mirrored in eval/search_eval.py — change both): IDF-weighted word coverage, name weight 3 vs description 1,
+// quality prior; category intent (s/ci.json): a multi-word task query that points at one category ranks that category's best tools
+// (s/cl.json) by quality; product words (brand or mostly used in tool names) must still match; brand boost (s/b.json).
+async function intentMembers(T, sc) {
+  const [CI, CL, B] = await Promise.all([jget("s/ci.json"), jget("s/cl.json"), jget("s/b.json")]);
+  if (!CI || !CL || T.length < 2) return { mem: new Set(), req: new Set() };
+  const req = new Set(T.filter(([t, o]) => (B && (B[t] || B[o])) || ((CI.t[t] || CI.t[o] || [0, 0, 0])[2] >= 0.4)).map(([t]) => t));
+  const by = new Map(); let tot = 0;
+  for (const [t, o] of T) {
+    const e = CI.t[t] || CI.t[o]; if (!e) continue;
+    const idf = Math.log(CI.n / (e[0] + 1)); tot += idf;
+    for (const [l2, p] of e[1]) by.set(l2, (by.get(l2) || 0) + p * idf);
+  }
+  if (!by.size) return { mem: new Set(), req };
+  const [l2, v] = [...by].sort((a, b) => b[1] - a[1])[0];
+  if (v / tot < 0.25) return { mem: new Set(), req };
+  const mem = new Set();
+  for (const c of CL[String(l2)] || []) {
+    const i = c >>> 11; mem.add(i);
+    if (!sc.has(i) && !req.size) sc.set(i, { n: 0, w: 0, c, t: new Set(), inj: true });
+  }
+  return { mem, req };
+}
+
 async function rank(q) {
   const T = await qterms(q);
   if (!T.length) return [];
-  const sc = new Map();
+  const sc = new Map(), idf = new Map(), N = 90000;
   const shards = await Promise.all(T.map(([t]) => jget("s/p/" + t.slice(0, 2) + ".json")));
   T.forEach(([t, o], n) => {
     const sh = shards[n]; if (!sh) return;
+    idf.set(t, Math.log(N / (((sh[t] || sh[o] || []).length) + 1)));
     const best = new Map();
     for (const [k, codes] of Object.entries(sh)) {
       const ex = k === t || k === o; if (!ex && !(t.length >= 4 && k.startsWith(t))) continue;
       for (const c of codes) { const w = ((c >> 9) & 3) * (ex ? 1 : 0.85), i = c >>> 11; if ((best.get(i) || [0])[0] < w) best.set(i, [w, c]); }
     }
-    for (const [i, [w, c]] of best) { const o = sc.get(i) || { n: 0, w: 0, c }; o.n++; o.w += w; sc.set(i, o); }
+    for (const [i, [w, c]] of best) { const x = sc.get(i) || { n: 0, w: 0, c, t: new Set() }; x.n++; x.w += w; x.t.add(t); sc.set(i, x); }
   });
-  let R = [...sc].map(([i, o]) => ({ i, c: o.c, n: o.n, s: o.n * 10 + o.w + ((o.c >> 5) & 15) * 0.3 }));
-  const full = R.filter(r => r.n === T.length); if (full.length) R = full;
-  // vendor boost: the maker's own tool first when the query names the brand (s/b.json from build_site.py vendor_brand)
+  const { mem, req } = await intentMembers(T, sc);
+  const tot = [...idf.values()].reduce((a, b) => a + b, 0) || 1, L = T.length;
+  let R = [...sc].map(([i, o]) => {
+    const b = (o.c >> 5) & 15, cov = [...o.t].reduce((a, t) => a + (idf.get(t) || 0), 0) / tot;
+    let s = 10 * L * cov + o.w + b * 0.3;
+    if (mem.has(i)) s = 10 * L * (0.6 + 0.4 * cov) * (o.inj ? 0.85 : 1) + Math.min(o.w, L) + 1.2 * b + 3;
+    else if (mem.size) s *= 0.9;
+    return { i, c: o.c, s, cov, m: mem.has(i), t: o.t };
+  });
+  const full = R.filter(r => r.cov >= 0.75 || (r.m && [...req].every(t => r.t.has(t)))); if (full.length) R = full;
   const B = (await jget("s/b.json")) || {}, vb = new Set(T.flatMap(([t, o]) => [...(B[t] || []), ...(B[o] || [])]));
   for (const r of R) if (vb.has(r.i)) r.s += 8;
   return R.sort((a, b) => b.s - a.s);
