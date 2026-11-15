@@ -6,8 +6,8 @@ const VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const CH = 500;
 const KIND = { 0: "skill", 1: "mcp", 2: "plugin" };
 const TAG = { v: "first_party", o: "verified_publisher", l: "live", f: "free_to_try" };
-const INSTRUCTIONS = `KitScout indexes ~84,000 AI agent tools: MCP servers (official MCP Registry), Agent Skills (GitHub SKILL.md) and Claude Code plugins, with GitHub stars, categories and a daily live check of every remote MCP server (live = answers; free_to_try = a read-only call worked with no API key).
-To plan an automation: split the user's workflow into steps, call search_tools once per step with short product/action keywords (e.g. "jira create issue", "slack post message", "google sheets"), prefer first_party, live and well-starred tools, then call get_tool on finalists for install lines and the actual tool list. If you already have candidates (from web search, a README or the user), call check_tools on them first: it verifies maker, maintenance, adoption and live status and suggests better alternatives. Name the tools you chose per step and why. Stars for Agent Skills are their repo's stars.`;
+const INSTRUCTIONS = `KitScout indexes ~88,000 AI agent tools: MCP servers (official MCP Registry and GitHub), Agent Skills (GitHub SKILL.md) and Claude Code plugins, with GitHub activity, publisher identity and a daily live check of every remote MCP server (live = answers; free_to_try = a read-only call worked with no API key).
+Tools: search_tools finds tools by product or task keywords; get_tool returns details, install or connect lines and a remote server's tool list; check_tools verifies tools the user already has in mind (maker, maintenance, adoption, live status, alternatives); list_categories lists categories. first_party = made by the product's own maker; verified_publisher = domain-verified publisher. Stars for Agent Skills are their repo's stars.`;
 
 // every index file is fetched with ?v=<build id> so a daily rebuild never mixes old shards with new meta (indices shift between builds)
 let VER = { v: "", at: 0 };
@@ -275,7 +275,7 @@ async function checkTools(args) {
 const TOOLS = [
   {
     name: "search_tools",
-    description: "Search ~84k AI agent tools (MCP servers, Agent Skills, Claude Code plugins) by keywords. Returns ranked matches with type, category, GitHub stars, badges (first_party = made by the product's own maker, verified_publisher, live, free_to_try), install line and KitScout page. Use short keywords: product + action, e.g. 'postgres', 'slack post message', 'pdf extract tables'.",
+    description: "Search ~88k AI agent tools (MCP servers, Agent Skills, Claude Code plugins) by keywords. Returns ranked matches with type, category, GitHub stars, badges (first_party = made by the product's own maker, verified_publisher, live, free_to_try), install line and KitScout page. Use short keywords: product + action, e.g. 'postgres', 'slack post message', 'pdf extract tables'.",
     inputSchema: {
       type: "object", required: ["query"], properties: {
         query: { type: "string", description: "Keywords (product names and actions work best)" },
@@ -287,25 +287,25 @@ const TOOLS = [
         limit: { type: "integer", minimum: 1, maximum: 25, description: "Max results (default 10)" },
       },
     },
-    annotations: { readOnlyHint: true, openWorldHint: false },
+    annotations: { title: "Search agent tools", readOnlyHint: true, openWorldHint: false },
   },
   {
     name: "get_tool",
-    description: "Details for one tool by its exact name from search_tools: description, badges, stars, repo, install or connect instructions, and for remote MCP servers the actual tool list the server exposes (from our live check).",
-    inputSchema: { type: "object", required: ["name"], properties: { name: { type: "string", description: "Exact tool name as returned by search_tools" } } },
-    annotations: { readOnlyHint: true, openWorldHint: false },
+    description: "Details for one KitScout tool by its exact name: description, badges, stars, repo, install or connect instructions, and for remote MCP servers the actual tool list the server exposes (from our live check).",
+    inputSchema: { type: "object", required: ["name"], properties: { name: { type: "string", description: "Exact tool name as listed in KitScout" } } },
+    annotations: { title: "Get tool details", readOnlyHint: true, openWorldHint: false },
   },
   {
     name: "check_tools",
     description: "Before installing tools you found elsewhere (web search, a README, a blog), verify them: is it the product maker's own tool, maintained (last code change, archived?), adopted (stars), does the remote server answer right now, where does your data go — with a verdict (ok / caution / avoid) and better alternatives. Pass up to 5 GitHub URLs, package ids (npm/pypi), remote MCP URLs or names per call.",
     inputSchema: { type: "object", required: ["tools"], properties: { tools: { type: "array", items: { type: "string" }, maxItems: 5, description: "e.g. https://github.com/owner/repo, @scope/package, https://mcp.example.com/mcp" } } },
-    annotations: { readOnlyHint: true, openWorldHint: true },
+    annotations: { title: "Check tools before installing", readOnlyHint: true, openWorldHint: true },
   },
   {
     name: "list_categories",
     description: "All KitScout categories (id, name, group, tool count). Useful to see what kinds of tools exist before searching.",
     inputSchema: { type: "object", properties: {} },
-    annotations: { readOnlyHint: true, openWorldHint: false },
+    annotations: { title: "List categories", readOnlyHint: true, openWorldHint: false },
   },
 ];
 
@@ -358,7 +358,7 @@ async function handle(msg, req, env, ctx) {
 const CORS = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "*", "Access-Control-Allow-Methods": "GET, POST, OPTIONS", "Access-Control-Expose-Headers": "Mcp-Session-Id" };
 const LANDING = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>KitScout MCP</title>
 <style>body{font:16px/1.6 system-ui,sans-serif;max-width:680px;margin:40px auto;padding:0 16px;color:#17332D;background:#EEF1EF}code{background:#fff;padding:2px 6px;border-radius:4px;word-break:break-all}</style>
-<h1>KitScout MCP server</h1><p>Lets your AI agent search ~84,000 MCP servers, Agent Skills and Claude Code plugins on <a href="${SITE}">kitscout.dev</a>, with live checks and install lines. Free, read-only, no key.</p>
+<h1>KitScout MCP server</h1><p>Lets your AI agent search ~88,000 MCP servers, Agent Skills and Claude Code plugins on <a href="${SITE}">kitscout.dev</a>, with live checks and install lines. Free, read-only, no key.</p>
 <p><b>Claude Code:</b> <code>claude mcp add --transport http kitscout https://mcp.kitscout.dev/mcp</code></p>
 <p><b>Claude app:</b> Settings → Connectors → Add custom connector → <code>https://mcp.kitscout.dev/mcp</code></p>
 <p>Tools: search_tools, get_tool, list_categories. Contact: contact@kitscout.dev</p>
