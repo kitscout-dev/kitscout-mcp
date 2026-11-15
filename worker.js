@@ -7,7 +7,7 @@ const CH = 500;
 const KIND = { 0: "skill", 1: "mcp", 2: "plugin" };
 const TAG = { v: "first_party", o: "verified_publisher", l: "live", f: "free_to_try" };
 const INSTRUCTIONS = `KitScout indexes ~84,000 AI agent tools: MCP servers (official MCP Registry), Agent Skills (GitHub SKILL.md) and Claude Code plugins, with GitHub stars, categories and a daily live check of every remote MCP server (live = answers; free_to_try = a read-only call worked with no API key).
-To plan an automation: split the user's workflow into steps, call search_tools once per step with short product/action keywords (e.g. "jira create issue", "slack post message", "google sheets"), prefer first_party, live and well-starred tools, then call get_tool on finalists for install lines and the actual tool list. Name the tools you chose per step and why. Stars for Agent Skills are their repo's stars.`;
+To plan an automation: split the user's workflow into steps, call search_tools once per step with short product/action keywords (e.g. "jira create issue", "slack post message", "google sheets"), prefer first_party, live and well-starred tools, then call get_tool on finalists for install lines and the actual tool list. If you already have candidates (from web search, a README or the user), call check_tools on them first: it verifies maker, maintenance, adoption and live status and suggests better alternatives. Name the tools you chose per step and why. Stars for Agent Skills are their repo's stars.`;
 
 // every index file is fetched with ?v=<build id> so a daily rebuild never mixes old shards with new meta (indices shift between builds)
 let VER = { v: "", at: 0 };
@@ -23,7 +23,8 @@ const cache = new Map();
 async function jget(path) {
   const key = path + "?v=" + (await ver());
   if (cache.has(key)) return cache.get(key);
-  const p = fetch(SITE + key, { cf: { cacheTtl: 86400, cacheEverything: true } }).then(r => (r.ok ? r.json() : null)).catch(() => null);
+  const p = fetch(SITE + key, { cf: { cacheTtl: 86400, cacheEverything: true } }).then(r => (r.ok ? r.json() : null)).catch(() => null)
+    .then(v => { if (v === null) cache.delete(key); return v; });  // never cache a failure (subrequest limit, network) — retry next call
   cache.set(key, p);
   if (cache.size > 400) cache.delete(cache.keys().next().value);
   return p;
@@ -152,6 +153,125 @@ async function listCategories() {
   return Object.entries(cats || {}).map(([id, [name, group, count]]) => ({ id, name, group, count }));
 }
 
+
+// ---- check_tools: verify candidates an agent found elsewhere (web search, README, a colleague) before installing them ----
+let ENV = {};
+async function md5hex(s) { const b = await crypto.subtle.digest("MD5", new TextEncoder().encode(s)); return [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, "0")).join(""); }
+function keyOf(raw) {
+  let s = String(raw || "").trim();
+  const gh = s.match(/github\.com\/([\w.-]+\/[\w.-]+?)(?:\.git)?(?:[/#?]|$)/i); if (gh) return { key: gh[1].toLowerCase(), repo: gh[1] };
+  if (/^https?:\/\//i.test(s)) return { key: s.replace(/^https?:\/\//i, "").split("?")[0].replace(/\/+$/, "").toLowerCase(), url: s };
+  s = s.replace(/^(npx|uvx|pipx|pip install|npm i|npm install)\s+(-y\s+)?/i, "").replace(/^(npm|pypi|oci|nuget|cargo):/i, "").trim();
+  if (/^@?[\w.-]+\/[\w.-]+$/.test(s) && !s.startsWith("@")) return { key: s.toLowerCase(), repo: s, pkg: s.toLowerCase() };
+  if (/^@[\w.-]+\/[\w.-]+/.test(s) || /^[\w.-]+$/.test(s)) return { key: s.replace(/(?<=.)@[^/@]*$/, "").toLowerCase(), alt: s.toLowerCase().replace(/[^a-z0-9]+/g, "") };
+  return { key: s.toLowerCase().replace(/[^a-z0-9]+/g, "") };
+}
+async function lookup(k) { const sh = await jget(`s/k/${(await md5hex(k)).slice(0, 2)}.json`); return (sh && sh[k]) || []; }
+async function extra(i) { const e = await jget(`s/e${Math.floor(i / CH)}.json`); return (e && e[i % CH]) || []; }
+async function probe(url) {  // live MCP initialize right now (5 s)
+  try {
+    const r = await fetch(url, { method: "POST", headers: { "content-type": "application/json", accept: "application/json, text/event-stream" }, signal: AbortSignal.timeout(5000),
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "kitscout-check", version: "1" } } }) });
+    return r.ok ? "answers" : (r.status === 401 || r.status === 403) ? "answers, sign-in or key required" : `HTTP ${r.status}`;
+  } catch (e) { return "no answer (timeout or connection error)"; }
+}
+async function ghRepo(repo) {
+  const h = { "User-Agent": "KitScout-check", Accept: "application/vnd.github+json" }; if (ENV.GITHUB_TOKEN) h.Authorization = "Bearer " + ENV.GITHUB_TOKEN;
+  const r = await fetch("https://api.github.com/repos/" + repo, { headers: h, cf: { cacheTtl: 3600 } }).catch(() => null);
+  if (!r) return null; if (r.status === 404) return { missing: true };
+  if (!r.ok) return null; return r.json();
+}
+const days = d => d ? Math.round((Date.now() - Date.parse(d)) / 864e5) : null;
+
+const GENERIC = new Set(["mcp", "server", "servers", "model", "context", "protocol", "tool", "tools", "agent", "agents", "ai", "llm", "claude", "for", "and", "with", "the", "your", "a", "an", "to", "of", "in", "via", "using", "official", "simple", "powerful", "lets", "allows", "enables", "integration", "api"]);
+async function alternativesFor(name, desc, kindCode, myBits, selfIdx, cats, onlyOfficial) {
+  // same job = search with the candidate's own name + description words; better = same kind, clearly higher quality prior
+  const clean = t => [...new Set((String(t).toLowerCase().match(/[a-z0-9]+/g) || []).filter(w => w.length > 2 && !GENERIC.has(w)))];
+  let words = clean(String(name).replace(/^.*\//, ""));  // the tool's own name says what it is for ('google-sheets-mcp')
+  words = [...new Set([...words, ...clean(desc).slice(0, 2)])].slice(0, 4);  // name + what the description says it does
+  const q = words.slice(0, 4).join(" ");
+  if (!q) return [];
+  const B = (await jget("s/b.json")) || {};
+  const RR = await rank(q), inR = new Set(RR.slice(0, 200).map(r => r.i));
+  const official = [...new Set(words.flatMap(w => B[st(w)] || []))].filter(j => j !== selfIdx && inR.has(j)).slice(0, 2);  // the maker's own tool first (must fit the job)
+  const R = RR.filter(r => r.i !== selfIdx && !official.includes(r.i) && ((r.c >> 3) & 3) === kindCode && ((r.c >> 5) & 15) >= myBits + 2).slice(0, 3 - official.length);
+  const metas = await Promise.all([...official, ...R.map(r => r.i)].map(meta));
+  return metas.map((m, n) => m && { ...shape(m, cats), why: n < official.length ? "official: made by the product's maker" : "same job, more adopted / better maintained" })
+    .filter(Boolean).filter(x => onlyOfficial ? x.why.startsWith("official") : true)
+    .map(x => ({ name: x.name, why: x.why, badges: x.badges, stars: x.stars ?? x.repo_stars, install: x.install, page: x.page }));
+}
+
+async function checkOne(raw, cats, arch) {
+  const k = keyOf(raw);
+  let hits = await lookup(k.key); if (!hits.length && k.alt) hits = await lookup(k.alt);
+  const res = { input: raw, in_kitscout: hits.length > 0 };
+  const reasons = [], facts = {};
+  let a = null, i = null;
+  if (hits.length) {
+    const ms = await Promise.all(hits.slice(0, 5).map(meta));
+    let k2 = 0;
+    if (k.repo) {  // a repo URL means the code: prefer an MCP-server entry, then anything not hosted by a third-party proxy
+      const pick = ms.findIndex(m => m && m[7].endsWith("m") && !String(m[4]).startsWith("https://")), local = ms.findIndex(m => m && !String(m[4]).startsWith("https://"));
+      k2 = pick >= 0 ? pick : local >= 0 ? local : 0;
+    }  // a repo URL means the code, not a third-party hosted proxy of it
+    i = hits[k2]; a = ms[k2];
+  }
+  if (a) {
+    const sh = shape(a, cats), [pushed, license, lstate, lat] = await extra(i);
+    Object.assign(res, { name: a[0], page: sh.page });
+    Object.assign(facts, { type: sh.type, category: sh.category, stars: sh.stars ?? sh.repo_stars, first_party: a[7].includes("v"), verified_publisher: a[7].includes("o"),
+      last_push_days: days(pushed), license: license || null, runs: sh.runs, install: sh.install, repo: sh.repo });
+    if (lstate) facts.daily_check = `${lstate} (${lat})`;
+    if (sh.install && sh.install.startsWith("https://")) facts.live_now = await probe(sh.install);
+  }
+  const repo = k.repo || (a && a[6]) || null;
+  if (repo && (!a || facts.last_push_days == null)) {
+    const g = await ghRepo(repo);
+    if (g && g.missing) { reasons.push("GitHub repo not found (deleted, private or renamed)"); res.verdict = "avoid"; }
+    else if (g) {
+      Object.assign(facts, { stars: facts.stars ?? g.stargazers_count, last_push_days: days(g.pushed_at), license: facts.license || (g.license && g.license.spdx_id) || null, archived: g.archived, repo: facts.repo || g.html_url });
+      if (g.full_name && g.full_name.toLowerCase() !== repo.toLowerCase()) {  // renamed repo: same project, look it up under the new name
+        facts.moved_to = g.full_name;
+        if (!a) { const h2 = await lookup(g.full_name.toLowerCase()); if (h2.length) { i = h2[0]; a = await meta(i); res.in_kitscout = true; } }
+      }
+      if (!a) { res.name = g.full_name; facts.description = g.description; }
+    }
+  }
+  if (a && !res.name) {  // found via the renamed repo
+    const sh = shape(a, cats);
+    Object.assign(res, { name: a[0], page: sh.page });
+    Object.assign(facts, { type: sh.type, category: sh.category, first_party: a[7].includes("v"), verified_publisher: a[7].includes("o"), runs: sh.runs, install: sh.install });
+  }
+  if (!a && k.url) facts.live_now = await probe(k.url);
+  if (repo && arch && arch.includes(repo.toLowerCase())) facts.archived = true;
+  // verdict
+  if (facts.archived) reasons.push("repository is archived (no longer maintained)");
+  if (facts.live_now && facts.live_now.startsWith("no answer")) reasons.push("remote server did not answer just now");
+  if (facts.live_now && facts.live_now.startsWith("HTTP")) reasons.push("remote server returned " + facts.live_now);
+  if (facts.last_push_days > 365) reasons.push(`no code changes for ${facts.last_push_days} days`);
+  else if (facts.last_push_days > 180) reasons.push(`slow maintenance: last change ${facts.last_push_days} days ago`);
+  if ((facts.stars ?? 0) < 10 && !facts.first_party) reasons.push(`little adoption (${facts.stars ?? 0} GitHub stars) and not made by the product's maker`);
+  if (!a && !repo && !k.url) reasons.push("not found in KitScout (88k tools) — check the exact name, repo URL or package id");
+  if (!res.verdict) res.verdict = (facts.archived || (facts.live_now || "").startsWith("no answer") || (facts.live_now || "").startsWith("HTTP 5") || facts.last_push_days > 365) ? "avoid" : reasons.length ? "caution" : "ok";
+  if (res.verdict === "ok" && facts.first_party) reasons.push("made by the product's own company");
+  res.reasons = reasons; res.facts = facts;
+  if (res.verdict !== "ok" || !facts.first_party) {
+    const bits = a ? await (async () => { for (const [t] of [[String(a[0]).toLowerCase()]]) { const r = (await rank(t)).find(x => x.i === i); if (r) return (r.c >> 5) & 15; } return Math.min(15, Math.floor(Math.log10((facts.stars || 0) + 1) * 2)); })() : Math.min(15, Math.floor(Math.log10((facts.stars || 0) + 1) * 2));
+    const kindCode = a ? ({ s: 0, m: 1, p: 2 }[a[7].slice(-1)] ?? 1) : 1;
+    // ok + not first-party: only point to the maker's own tool; caution/avoid: also more adopted tools for the same job
+    const alts = await alternativesFor(res.name || raw, a ? a[5] : facts.description, kindCode, bits, i, cats, res.verdict === "ok");
+    if (alts.length) res.alternatives = alts;
+  }
+  return res;
+}
+
+async function checkTools(args) {
+  const list = (Array.isArray(args.tools) ? args.tools : [args.tools]).filter(Boolean).slice(0, 5);  // Workers free plan: 50 subrequests per call
+  if (!list.length) return { error: "Pass tools: a list of repo URLs, package ids (npm/pypi), remote MCP URLs or names." };
+  const [cats, arch] = await Promise.all([jget("s/cats.json"), jget("s/arch.json")]);
+  return { checked: await Promise.all(list.map(x => checkOne(x, cats, arch))), note: "verdict: ok / caution / avoid. live_now = we called the remote server during this check." };
+}
+
 const TOOLS = [
   {
     name: "search_tools",
@@ -176,6 +296,12 @@ const TOOLS = [
     annotations: { readOnlyHint: true, openWorldHint: false },
   },
   {
+    name: "check_tools",
+    description: "Before installing tools you found elsewhere (web search, a README, a blog), verify them: is it the product maker's own tool, maintained (last code change, archived?), adopted (stars), does the remote server answer right now, where does your data go — with a verdict (ok / caution / avoid) and better alternatives. Pass up to 5 GitHub URLs, package ids (npm/pypi), remote MCP URLs or names per call.",
+    inputSchema: { type: "object", required: ["tools"], properties: { tools: { type: "array", items: { type: "string" }, maxItems: 5, description: "e.g. https://github.com/owner/repo, @scope/package, https://mcp.example.com/mcp" } } },
+    annotations: { readOnlyHint: true, openWorldHint: true },
+  },
+  {
     name: "list_categories",
     description: "All KitScout categories (id, name, group, tool count). Useful to see what kinds of tools exist before searching.",
     inputSchema: { type: "object", properties: {} },
@@ -195,9 +321,9 @@ function logRow(env, ctx, req, method, params, data) {
   if (!env || !env.LOG) return;
   const a = (params && params.arguments) || {};
   const tool = method === "tools/call" ? String(params.name || "").slice(0, 40) : method;
-  const q = String(a.query || a.name || "").slice(0, 200);
+  const q = String(a.query || a.name || (Array.isArray(a.tools) ? a.tools.join(" | ") : a.tools) || "").slice(0, 500);
   const filters = ["type", "only_official", "only_live", "only_free_to_try", "limit"].filter(k => a[k] !== undefined).map(k => k + "=" + a[k]).join(",");
-  const res = data && data.results ? data.results.map(r => r.name).slice(0, 10) : data && data.name ? [data.name] : [];
+  const res = data && data.results ? data.results.map(r => r.name).slice(0, 10) : data && data.checked ? data.checked.map(c => `${c.name || c.input}:${c.verdict}`) : data && data.name ? [data.name] : [];
   const n = data && (data.total_matches ?? (data.error ? 0 : data.name ? 1 : null));
   ctx.waitUntil(env.LOG.prepare("INSERT INTO q (ts, country, client, tool, query, filters, n, results) VALUES (?,?,?,?,?,?,?,?)")
     .bind(new Date().toISOString().slice(0, 16), (req.cf && req.cf.country) || "", clientOf(req, params), tool, q, filters, n ?? null, JSON.stringify(res))
@@ -216,7 +342,7 @@ async function handle(msg, req, env, ctx) {
   if (method === "ping") return ok({});
   if (method === "tools/list") return ok({ tools: TOOLS });
   if (method === "tools/call") {
-    const fn = { search_tools: searchTools, get_tool: getTool, list_categories: listCategories }[params.name];
+    const fn = { search_tools: searchTools, get_tool: getTool, check_tools: checkTools, list_categories: listCategories }[params.name];
     if (!fn) return err(-32602, "Unknown tool: " + params.name);
     try {
       const data = await fn(params.arguments || {});
@@ -240,6 +366,7 @@ const LANDING = `<!doctype html><meta charset="utf-8"><meta name="viewport" cont
 
 export default {
   async fetch(req, env, ctx) {
+    ENV = env || {};
     const url = new URL(req.url);
     if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
     if (url.pathname !== "/mcp") return new Response(LANDING, { headers: { "content-type": "text/html; charset=utf-8" } });
