@@ -63,14 +63,18 @@ async function intentMembers(T, sc) {
   return { mem, req };
 }
 
-async function rank(q) {
-  const T = await qterms(q);
+// constraint phrases are not search words: 'web search no api key' -> search 'web search', prefer tools that worked without a key
+const FREE_RE = /\b(?:no|without|zero)\s+(?:an?\s+)?(?:api\s+)?(?:keys?|sign[- ]?ups?|auth|accounts?|registration)\b|\bkeyless\b|\bfree\b|\bno[- ]key\b/g;
+async function rank(q0) {
+  const q = String(q0).toLowerCase().replace(FREE_RE, " "), prefFree = q !== String(q0).toLowerCase();
+  let T = await qterms(q);
+  if (!T.length && prefFree) T = await qterms(q0);  // query was only a constraint ('free')
   if (!T.length) return [];
   const sc = new Map(), idf = new Map(), N = 90000;
   const shards = await Promise.all(T.map(([t]) => jget("s/p/" + t.slice(0, 2) + ".json")));
   T.forEach(([t, o], n) => {
     const sh = shards[n]; if (!sh) return;
-    idf.set(t, Math.log(N / (((sh[t] || sh[o] || []).length) + 1)));
+    idf.set(t, Math.log(N / (Math.max((sh[t] || []).length, (sh[o] || []).length) + 1)));  // stem and word: a 1-entry stem key ('youtub') must not make 'youtube' look rare
     const best = new Map();
     for (const [k, codes] of Object.entries(sh)) {
       const ex = k === t || k === o; if (!ex && !(t.length >= 4 && k.startsWith(t))) continue;
@@ -84,6 +88,7 @@ async function rank(q) {
     const b = (o.c >> 5) & 15, cov = [...o.t].reduce((a, t) => a + (idf.get(t) || 0), 0) / tot;
     let s = 10 * L * cov + o.w + b * 0.3;
     if (mem.has(i)) s = 10 * L * (0.6 + 0.4 * cov) * (o.inj ? 0.85 : 1) + Math.min(o.w, L) + 1.2 * b + 3;
+    else if (mem.size && cov >= 0.99) s = 10 * L + Math.min(o.w, L) + 1.2 * b + 3;  // every word matches but filed elsewhere (often misfiled): quality counts like a member
     else if (mem.size) s *= 0.9;
     return { i, c: o.c, s, cov, m: mem.has(i), t: o.t, nt: o.nt || new Set() };
   });
@@ -95,7 +100,7 @@ async function rank(q) {
     // platform words must be in the NAME (a description that mentions Slack is not a Slack tool); other product words anywhere
     const R2 = R.filter(r => need.every(t => r.nt.has(t) || bm(t).has(r.i) || (!pw.has(t) && r.t.has(t)))); if (R2.length) R = R2; }
   const B = (await jget("s/b.json")) || {}, vb = new Set(T.flatMap(([t, o]) => [...(B[t] || []), ...(B[o] || [])]));
-  for (const r of R) if (vb.has(r.i)) r.s += 8;
+  for (const r of R) { if (vb.has(r.i)) { r.s += 8; r.vb = true; } if (prefFree && (r.c & 1)) r.s += 2; }  // c bit 0 = worked without an API key
   return R.sort((a, b) => b.s - a.s);
 }
 
@@ -106,27 +111,68 @@ function shape(a, cats) {
     name, type: { p: "plugin", s: "skill", m: "mcp" }[tags.slice(-1)] || "mcp",
     category: (cats && cats[l2] && cats[l2][0]) || l2,
     ...(tags.endsWith("s") ? { repo_stars: stars, stars_note: "GitHub stars of the whole repo this skill lives in, not of the skill itself" } : { stars }),
-    runs: install.startsWith("https://") ? `remote: your requests and data go to ${install.split("/")[2]}` : tags.endsWith("s") ? "local: runs inside your agent" : install ? "local: runs on your machine" : "unknown",
+    runs: /[{}<>]/.test(install) ? "self-hosted: the URL is a template, fill in your own host" : install.startsWith("https://") ? `remote: your requests and data go to ${install.split("/")[2]}` : tags.endsWith("s") ? "local: runs inside your agent" : install ? "local: runs on your machine" : "unknown",
     badges: [...tags].map(g => TAG[g]).filter(Boolean),
     install: install || null, description: desc,
     page: link.startsWith("http") ? link : SITE + link.replace(/\.html(\?|$)/, "$1"), repo: repo ? "https://github.com/" + repo : null,
   };
 }
 
+// Non-English queries (2026-11-15: '카카오톡 메시지' returned nothing): translate to English with Workers AI, then search.
+const SCRIPTS = [[/[\uac00-\ud7af]/, "korean"], [/[\u3040-\u30ff]/, "japanese"], [/[\u4e00-\u9fff]/, "chinese"], [/[\u0400-\u04ff]/, "russian"], [/[\u0600-\u06ff]/, "arabic"]];
+async function toEnglish(q) {
+  const lang = (SCRIPTS.find(([re]) => re.test(q)) || [])[1];
+  if (!lang || !ENV.AI) return null;
+  try {
+    // small LLM, not m2m100: m2m100 turned 카카오톡 into 'Cacao'; brand names must come out in their official English form
+    const r = await ENV.AI.run("@cf/meta/llama-3.2-3b-instruct", { max_tokens: 24, temperature: 0, messages: [
+      { role: "system", content: "Translate the user's " + lang + " search for AI agent tools into ONE short English search query of 2-4 words: product name + action, like 'notion create page' or 'kakaotalk send message'. Write product and brand names in their official English spelling (카카오톡 -> kakaotalk, 노션 -> notion). No synonyms, no alternatives, no punctuation. Reply with the query only." },
+      { role: "user", content: q }] });
+    const t = String((r && r.response) || "").split("\n")[0].split(",")[0].replace(/["'.]/g, " ").replace(/^(keywords?|query):\s*/i, "").trim().split(/\s+/).slice(0, 5).join(" ");
+    return t && /[a-z]/i.test(t) ? t.slice(0, 200) : null;
+  } catch (e) { return null; }  // daily free allowance used up or model error: fall back to the original words
+}
+
+// Meaning-based re-ranking (2026-11-15): word search finds candidates, a cross-encoder (Workers AI bge-reranker-base, free daily
+// allowance) orders them by what the query MEANS ('speech to text' != 'text to speech'). Brand-boosted official tools stay on top;
+// single-word queries (product names) keep the word ranking. Any AI error -> word ranking unchanged.
+async function rerank(q, pool, rows, w, qw) {
+  const W = w === undefined ? 0.4 : +w, Q = qw === undefined ? 0.3 : +qw;  // meaning vs word-rank vs quality prior
+  if (!ENV.AI || !W || q.trim().split(/\s+/).length < 2 || rows.length < 3) return rows;
+  const idx = rows.map((a, i) => i).filter(i => rows[i] && !pool[i].vb);
+  if (idx.length < 3) return rows;
+  try {
+    const r = await ENV.AI.run("@cf/baai/bge-reranker-base", { query: q, contexts: idx.map(i => ({ text: (rows[i][0] + ". " + (rows[i][5] || "")).slice(0, 400) })) });
+    const sc = new Map((r.response || r || []).map(x => [x.id, x.score]));
+    const vals = [...sc.values()], lo = Math.min(...vals), hi = Math.max(...vals), span = hi - lo || 1;
+    const n = idx.length, fin = idx.map((i, k) => ({ i, f: W * (((sc.get(k) ?? lo) - lo) / span) + Math.max(0, 1 - W - Q) * (1 - k / n) + Q * (((pool[i].c >> 5) & 15) / 15) }));
+    fin.sort((a, b) => b.f - a.f);
+    const pinned = rows.map((a, i) => i).filter(i => rows[i] && pool[i].vb);
+    return [...pinned, ...fin.map(x => x.i)].map(i => rows[i]);
+  } catch (e) { return rows; }
+}
+
 async function searchTools(args) {
-  const q = String(args.query || "").slice(0, 200), lim = Math.min(Math.max(+args.limit || 10, 1), 25);
+  const q0 = String(args.query || "").slice(0, 200), lim = Math.min(Math.max(+args.limit || 10, 1), 25);
+  const tr = await toEnglish(q0), q = tr || q0;
   const want = { mcp: 1, skill: 0, plugin: 2 }[args.type];
   const bits = (args.only_verified || args.only_official ? 4 : 0) | (args.only_live ? 2 : 0) | (args.only_free_to_try ? 1 : 0);
   const R = (await rank(q)).filter(r => (want === undefined || ((r.c >> 3) & 3) === want) && (r.c & bits) === bits);
   // at most 2 results per source repo (one 300-skill pack must not fill the list)
-  const [cats, ...rows] = await Promise.all([jget("s/cats.json"), ...R.slice(0, lim * 3).map(r => meta(r.i))]);
-  const per = new Map(), out = [];
+  const pool = R.slice(0, Math.max(lim * 3, 30));
+  const [cats, ...rows0] = await Promise.all([jget("s/cats.json"), ...pool.map(r => meta(r.i))]);
+  const rows = await rerank(q, pool, rows0, args._rr, args._q);
+  const per = new Map(), out = [], also = new Map(), nn = s => String(s).toLowerCase().replace(/^.*\//, "").replace(/[^a-z0-9]+/g, "");
   for (const a of rows) {
     if (!a || out.length >= lim) continue;
+    // same repo + same name = one product shipped two ways (Slack remote server + Slack plugin): one row, the other install line as also_install
+    const twin = out.find(b => a[6] && b[6] === a[6] && nn(b[0]) === nn(a[0]));
+    if (twin) { if (a[4] && a[4] !== twin[4]) also.set(twin, a[4]); continue; }
     const k = a[6] || a[0]; per.set(k, (per.get(k) || 0) + 1);
     if (per.get(k) <= 2) out.push(a);
   }
-  return { query: q, total_matches: R.length, results: out.map(a => shape(a, cats)) };
+  if (!R.length && /[^\x00-\x7f]/.test(q)) return { query: q0, total_matches: 0, results: [], hint: "No match. KitScout indexes English names and descriptions: retry with English keywords (product + action, e.g. 'kakaotalk message')." };
+  return { query: q0, ...(tr ? { searched_as: tr } : {}), total_matches: R.length, results: out.map(a => Object.assign(shape(a, cats), also.has(a) ? { also_install: also.get(a) } : {})) };
 }
 
 async function getTool(args) {
@@ -235,7 +281,8 @@ async function checkOne(raw, cats, arch) {
     Object.assign(facts, { type: sh.type, category: sh.category, stars: sh.stars ?? sh.repo_stars, first_party: a[7].includes("v"), verified_publisher: a[7].includes("o"),
       last_push_days: days(pushed), license: license || null, runs: sh.runs, install: sh.install, repo: sh.repo });
     if (lstate) facts.daily_check = `${lstate} (${lat})`;
-    if (sh.install && sh.install.startsWith("https://")) facts.live_now = await probe(sh.install);
+    if (sh.install && /[{}<>]/.test(sh.install)) facts.runs = "self-hosted: the URL is a template, fill in your own host";
+    else if (sh.install && sh.install.startsWith("https://")) facts.live_now = await probe(sh.install);
   }
   const repo = k.repo || (a && a[6]) || null;
   if (repo && (!a || facts.last_push_days == null)) {
@@ -259,24 +306,35 @@ async function checkOne(raw, cats, arch) {
   // npm deprecation = the maker says stop using it (e.g. @modelcontextprotocol/server-postgres). 1 subrequest.
   const npmName = (/^@[\w.-]+\/[\w.-]+$/.test(String(raw).trim().replace(/^(npx|npm i|npm install)\s+(-y\s+)?/i, "").replace(/^npm:/i, "").replace(/(?<=.)@[^/@]*$/, "")) && String(raw).trim().replace(/^(npx|npm i|npm install)\s+(-y\s+)?/i, "").replace(/^npm:/i, "").replace(/(?<=.)@[^/@]*$/, ""))
     || (facts.install && /^npm:/.test(facts.install) ? facts.install.slice(4).replace(/(?<=.)@[^/@]*$/, "") : null);
+  let npmFound = false;
   if (npmName) {
     const r = await fetch("https://registry.npmjs.org/" + npmName.replace("/", "%2f") + "/latest", { cf: { cacheTtl: 3600 } }).catch(() => null);
     const j = r && r.ok ? await r.json().catch(() => null) : null;
     if (j && j.deprecated) facts.deprecated = String(j.deprecated).slice(0, 200);
     if (j && !res.name) res.name = j.name;
     if (j && !facts.description && j.description) facts.description = String(j.description).slice(0, 200);
+    // not in KitScout but on npm (2026-11-15: @modelcontextprotocol/server-filesystem was 'not found'): follow package.json repository
+    if (j) npmFound = true;
+    const m = j && facts.stars == null && String((j.repository && (j.repository.url || j.repository)) || "").match(/github\.com[/:]([\w.-]+\/[\w.-]+?)(?:\.git)?(?:[/#].*)?$/i);
+    if (m) {
+      const g = await ghRepo(m[1]);
+      if (g && !g.missing) Object.assign(facts, { stars: g.stargazers_count, last_push_days: days(g.pushed_at), license: facts.license || (g.license && g.license.spdx_id) || null, archived: facts.archived || g.archived, repo: facts.repo || g.html_url });
+    }
   }
   if (repo && arch && arch.includes(repo.toLowerCase())) facts.archived = true;
   // verdict
   if (facts.deprecated) reasons.push("npm package is deprecated by its maker: " + facts.deprecated);
   if (facts.archived) reasons.push("repository is archived (no longer maintained)");
-  if (facts.live_now && facts.live_now.startsWith("no answer")) reasons.push("remote server did not answer just now");
-  if (facts.live_now && facts.live_now.startsWith("HTTP")) reasons.push("remote server returned " + facts.live_now);
-  if (facts.last_push_days > 365) reasons.push(`no code changes for ${facts.last_push_days} days`);
+  // input was a repo (= the code): a hosted endpoint of it being down is a note, not a reason to avoid the code (2026-11-15: metabase, marmot)
+  const codeInput = !!k.repo && !k.url, liveFail = !!facts.live_now && (facts.live_now.startsWith("no answer") || facts.live_now.startsWith("HTTP 5"));
+  if (facts.live_now && facts.live_now.startsWith("no answer")) reasons.push(codeInput ? `its hosted endpoint (${facts.install}) did not answer just now; self-hosting the code is unaffected` : "remote server did not answer just now");
+  if (facts.live_now && facts.live_now.startsWith("HTTP")) reasons.push((codeInput ? "its hosted endpoint returned " : "remote server returned ") + facts.live_now);
+  if (facts.last_push_days > 730) reasons.push(`no code changes for ${facts.last_push_days} days (abandoned)`);
+  else if (facts.last_push_days > 365) reasons.push(`no code changes for ${facts.last_push_days} days: may be finished or unmaintained`);
   else if (facts.last_push_days > 180) reasons.push(`slow maintenance: last change ${facts.last_push_days} days ago`);
   if ((facts.stars ?? 0) < 10 && !facts.first_party && !facts.deprecated && facts.stars != null) reasons.push(`little adoption (${facts.stars ?? 0} GitHub stars) and not made by the product's maker`);
-  if (!a && !repo && !k.url && !facts.deprecated) reasons.push("not found in KitScout (88k tools) — check the exact name, repo URL or package id");
-  if (!res.verdict) res.verdict = (facts.archived || facts.deprecated || (facts.live_now || "").startsWith("no answer") || (facts.live_now || "").startsWith("HTTP 5") || facts.last_push_days > 365) ? "avoid" : reasons.length ? "caution" : "ok";
+  if (!a && !repo && !k.url && !facts.deprecated && !npmFound) reasons.push("not found in KitScout (88k tools) — check the exact name, repo URL or package id");
+  if (!res.verdict) res.verdict = (facts.archived || facts.deprecated || (liveFail && !codeInput) || facts.last_push_days > 730) ? "avoid" : reasons.length ? "caution" : "ok";
   if (res.verdict === "ok" && facts.first_party) reasons.push("made by the product's own company");
   res.reasons = reasons; res.facts = facts;
   if (res.verdict !== "ok" || !facts.first_party) {
