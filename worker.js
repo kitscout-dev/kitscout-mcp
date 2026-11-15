@@ -5,9 +5,9 @@ const SITE = "https://kitscout.dev/";
 const VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const CH = 500;
 const KIND = { 0: "skill", 1: "mcp", 2: "plugin" };
-const TAG = { o: "official", l: "live", f: "free_to_try" };
+const TAG = { v: "first_party", o: "verified_publisher", l: "live", f: "free_to_try" };
 const INSTRUCTIONS = `KitScout indexes ~84,000 AI agent tools: MCP servers (official MCP Registry), Agent Skills (GitHub SKILL.md) and Claude Code plugins, with GitHub stars, categories and a daily live check of every remote MCP server (live = answers; free_to_try = a read-only call worked with no API key).
-To plan an automation: split the user's workflow into steps, call search_tools once per step with short product/action keywords (e.g. "jira create issue", "slack post message", "google sheets"), prefer official, live and well-starred tools, then call get_tool on finalists for install lines and the actual tool list. Name the tools you chose per step and why. Stars for Agent Skills are their repo's stars.`;
+To plan an automation: split the user's workflow into steps, call search_tools once per step with short product/action keywords (e.g. "jira create issue", "slack post message", "google sheets"), prefer first_party, live and well-starred tools, then call get_tool on finalists for install lines and the actual tool list. Name the tools you chose per step and why. Stars for Agent Skills are their repo's stars.`;
 
 // every index file is fetched with ?v=<build id> so a daily rebuild never mixes old shards with new meta (indices shift between builds)
 let VER = { v: "", at: 0 };
@@ -55,6 +55,9 @@ async function rank(q) {
   });
   let R = [...sc].map(([i, o]) => ({ i, c: o.c, n: o.n, s: o.n * 10 + o.w + ((o.c >> 5) & 15) * 0.3 }));
   const full = R.filter(r => r.n === T.length); if (full.length) R = full;
+  // vendor boost: the maker's own tool first when the query names the brand (s/b.json from build_site.py vendor_brand)
+  const B = (await jget("s/b.json")) || {}, vb = new Set(T.flatMap(([t, o]) => [...(B[t] || []), ...(B[o] || [])]));
+  for (const r of R) if (vb.has(r.i)) r.s += 8;
   return R.sort((a, b) => b.s - a.s);
 }
 
@@ -75,10 +78,17 @@ function shape(a, cats) {
 async function searchTools(args) {
   const q = String(args.query || "").slice(0, 200), lim = Math.min(Math.max(+args.limit || 10, 1), 25);
   const want = { mcp: 1, skill: 0, plugin: 2 }[args.type];
-  const bits = (args.only_official ? 4 : 0) | (args.only_live ? 2 : 0) | (args.only_free_to_try ? 1 : 0);
+  const bits = (args.only_verified || args.only_official ? 4 : 0) | (args.only_live ? 2 : 0) | (args.only_free_to_try ? 1 : 0);
   const R = (await rank(q)).filter(r => (want === undefined || ((r.c >> 3) & 3) === want) && (r.c & bits) === bits);
-  const [cats, ...rows] = await Promise.all([jget("s/cats.json"), ...R.slice(0, lim).map(r => meta(r.i))]);
-  return { query: q, total_matches: R.length, results: rows.filter(Boolean).map(a => shape(a, cats)) };
+  // at most 2 results per source repo (one 300-skill pack must not fill the list)
+  const [cats, ...rows] = await Promise.all([jget("s/cats.json"), ...R.slice(0, lim * 3).map(r => meta(r.i))]);
+  const per = new Map(), out = [];
+  for (const a of rows) {
+    if (!a || out.length >= lim) continue;
+    const k = a[6] || a[0]; per.set(k, (per.get(k) || 0) + 1);
+    if (per.get(k) <= 2) out.push(a);
+  }
+  return { query: q, total_matches: R.length, results: out.map(a => shape(a, cats)) };
 }
 
 async function getTool(args) {
@@ -113,12 +123,13 @@ async function listCategories() {
 const TOOLS = [
   {
     name: "search_tools",
-    description: "Search ~84k AI agent tools (MCP servers, Agent Skills, Claude Code plugins) by keywords. Returns ranked matches with type, category, GitHub stars, badges (official, live, free_to_try), install line and KitScout page. Use short keywords: product + action, e.g. 'postgres', 'slack post message', 'pdf extract tables'.",
+    description: "Search ~84k AI agent tools (MCP servers, Agent Skills, Claude Code plugins) by keywords. Returns ranked matches with type, category, GitHub stars, badges (first_party = made by the product's own maker, verified_publisher, live, free_to_try), install line and KitScout page. Use short keywords: product + action, e.g. 'postgres', 'slack post message', 'pdf extract tables'.",
     inputSchema: {
       type: "object", required: ["query"], properties: {
         query: { type: "string", description: "Keywords (product names and actions work best)" },
         type: { type: "string", enum: ["mcp", "skill", "plugin"], description: "Only this kind of tool" },
-        only_official: { type: "boolean", description: "Only official / verified-domain publishers" },
+        only_verified: { type: "boolean", description: "Only verified publishers (domain-verified registry namespace, Anthropic marketplace). Does not mean made by the product's vendor; see the first_party badge" },
+        only_official: { type: "boolean", description: "Deprecated alias of only_verified" },
         only_live: { type: "boolean", description: "Only remote MCP servers that answered our latest daily check" },
         only_free_to_try: { type: "boolean", description: "Only remote MCP servers that worked without an API key" },
         limit: { type: "integer", minimum: 1, maximum: 25, description: "Max results (default 10)" },

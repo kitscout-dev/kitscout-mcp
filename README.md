@@ -17,7 +17,7 @@ Let your AI agent find the right tool for the job. KitScout indexes **~84,000 AI
 
 | Tool | What it does |
 |---|---|
-| `search_tools(query, type?, only_official?, only_live?, only_free_to_try?, limit?)` | Ranked keyword search across MCP servers, skills and plugins. Each result: type, category, stars, badges (`official`, `live`, `free_to_try`), where it runs, install line, KitScout page. |
+| `search_tools(query, type?, only_official?, only_live?, only_free_to_try?, limit?)` | Ranked keyword search across MCP servers, skills and plugins. Each result: type, category, stars, badges (`first_party` = made by the product's own maker, `verified_publisher`, `live`, `free_to_try`), where it runs, install line, KitScout page. |
 | `get_tool(name)` | Full details for one tool, including the **actual tool list** a remote server exposes (from our live check) and a ready-to-paste connect/install line. |
 | `list_categories()` | All categories with tool counts. |
 
