@@ -111,6 +111,7 @@ async function getTool(args) {
   };
   else if (out.type === "skill" && out.repo) out.how_to_install = `Copy the skill folder (with SKILL.md) from ${out.repo} into ~/.claude/skills/ (or .claude/skills/ in a project).`;
   else if (ins) out.how_to_install = ins;
+  else if (out.repo) out.how_to_install = `Not in the MCP Registry: follow the install steps in the README at ${out.repo}.`;
   return out;
 }
 const slugName = s => s.toLowerCase().replace(/^.*\//, "").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40) || "server";
