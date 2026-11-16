@@ -445,7 +445,12 @@ async function watchAdd(env, kid, items) {  // items: [{tool, verdict}]; returns
   if (stmts.length) await env.LOG.batch(stmts);
   return { watching: have.size, max: WATCH_MAX, skipped };
 }
-async function watchlist(args, env, kid) {
+const GUARD_REPORT = 'node "$HOME/.kitscout/guard.mjs" --report';
+async function watchlist(args, env, kid, via) {
+  // KitScout Claude Code plugin (connects with ?via=plugin): installed tools are watched locally by the stack guard, no key needed
+  if (!kid && via === "plugin") return { watched_by: "KitScout stack guard (Claude Code plugin)",
+    how: `Every MCP server and plugin installed in this Claude Code is checked automatically (at most once a day, at session start). For the current report run: ${GUARD_REPORT}  (add --refresh first for a fresh check; it takes up to a minute). Then use check_tools on flagged tools for alternatives.`,
+    note: "Nothing to add or remove by hand: the stack guard follows what is installed. Use the check-my-stack skill for the full flow." };
   if (!kid) return { error: `No KitScout key on this connection. Get a free key at ${WATCH_URL} and connect with https://mcp.kitscout.dev/mcp?key=<your key>. Then every tool you check is watched, and you get an email when one is renamed, archived, deprecated or stops answering.` };
   const rm = (Array.isArray(args.remove) ? args.remove : args.remove ? [args.remove] : []).map(String).slice(0, WATCH_MAX);
   if (rm.length) await env.LOG.batch(rm.map(t => env.LOG.prepare("DELETE FROM watch WHERE kid = ? AND tool = ?").bind(kid, t)));
@@ -531,6 +536,7 @@ const clientOf = (req, params) => {
 };
 function logRow(env, ctx, req, method, params, data, kid) {
   if (!env || !env.LOG) return;
+  if (new URL(req.url).searchParams.get("via") === "plugin") params = { ...params, clientInfo: { name: (clientOf(req, params) || "unknown").slice(0, 32) + "+plugin" } };
   const a = (params && params.arguments) || {};
   const tool = method === "tools/call" ? String(params.name || "").slice(0, 40) : method;
   const q = String(a.query || a.name || (Array.isArray(a.tools) ? a.tools.join(" | ") : a.tools) || "").slice(0, 500);
@@ -542,7 +548,7 @@ function logRow(env, ctx, req, method, params, data, kid) {
     .run().catch(() => {}));
 }
 
-async function handle(msg, req, env, ctx, kid) {
+async function handle(msg, req, env, ctx, kid, via) {
   const { id, method, params = {} } = msg;
   const ok = result => ({ jsonrpc: "2.0", id, result });
   const err = (code, message) => ({ jsonrpc: "2.0", id, error: { code, message } });
@@ -554,7 +560,7 @@ async function handle(msg, req, env, ctx, kid) {
   if (method === "ping") return ok({});
   if (method === "tools/list") return ok({ tools: TOOLS });
   if (method === "tools/call") {
-    const fn = { search_tools: searchTools, get_tool: getTool, check_tools: checkTools, list_categories: listCategories, watchlist: a => watchlist(a, env, kid) }[params.name];
+    const fn = { search_tools: searchTools, get_tool: getTool, check_tools: checkTools, list_categories: listCategories, watchlist: a => watchlist(a, env, kid, via) }[params.name];
     if (!fn) return err(-32602, "Unknown tool: " + params.name);
     try {
       const data = await fn(params.arguments || {});
@@ -596,8 +602,8 @@ export default {
     let body;
     try { body = await req.json(); } catch { return Response.json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }, { status: 400, headers: CORS }); }
     const msgs = Array.isArray(body) ? body : [body];
-    const kid = await keyId(req, url, env);
-    const out = (await Promise.all(msgs.filter(m => m && m.id !== undefined && m.method).map(m => handle(m, req, env, ctx, kid))));
+    const kid = await keyId(req, url, env), via = url.searchParams.get("via") === "plugin" ? "plugin" : null;
+    const out = (await Promise.all(msgs.filter(m => m && m.id !== undefined && m.method).map(m => handle(m, req, env, ctx, kid, via))));
     if (!out.length) return new Response(null, { status: 202, headers: CORS });
     return Response.json(Array.isArray(body) ? out : out[0], { headers: CORS });
   },
