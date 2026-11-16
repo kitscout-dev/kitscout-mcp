@@ -100,7 +100,9 @@ async function rank(q0) {
     // platform words must be in the NAME (a description that mentions Slack is not a Slack tool); other product words anywhere
     const R2 = R.filter(r => need.every(t => r.nt.has(t) || bm(t).has(r.i) || (!pw.has(t) && r.t.has(t)))); if (R2.length) R = R2; }
   const B = (await jget("s/b.json")) || {}, vb = new Set(T.flatMap(([t, o]) => [...(B[t] || []), ...(B[o] || [])]));
-  for (const r of R) { if (vb.has(r.i)) { r.s += 8; r.vb = true; } if (prefFree && (r.c & 1)) r.s += 2; }  // c bit 0 = worked without an API key
+  // full +8 only for the maker's flagship tools; its minor tools (3-star CLI) get +1 so a popular community tool can stay above them ('jira')
+  const bmax = Math.max(0, ...R.filter(r => vb.has(r.i)).map(r => (r.c >> 5) & 15));
+  for (const r of R) { if (vb.has(r.i)) { r.s += ((r.c >> 5) & 15) >= bmax - 4 ? 8 : 1; r.vb = true; } if (prefFree && (r.c & 1)) r.s += 2; }  // c bit 0 = worked without an API key
   return R.sort((a, b) => b.s - a.s);
 }
 
