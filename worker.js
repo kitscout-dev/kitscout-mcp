@@ -213,6 +213,7 @@ let ENV = {};
 async function md5hex(s) { const b = await crypto.subtle.digest("MD5", new TextEncoder().encode(s)); return [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, "0")).join(""); }
 function keyOf(raw) {
   let s = String(raw || "").trim();
+  if (/^plugin:/i.test(s)) return { key: s.slice(7).trim().toLowerCase() };  // Claude Code plugin as installed: name@marketplace
   const gh = s.match(/github\.com\/([\w.-]+\/[\w.-]+?)(?:\.git)?(?:[/#?]|$)/i); if (gh) return { key: gh[1].toLowerCase(), repo: gh[1] };
   if (/^https?:\/\//i.test(s)) return { key: s.replace(/^https?:\/\//i, "").split("?")[0].replace(/\/+$/, "").toLowerCase(), url: s };
   s = s.replace(/^(npx|uvx|pipx|pip install|npm i|npm install)\s+(-y\s+)?/i, "").replace(/^(npm|pypi|oci|nuget|cargo):/i, "").trim();
@@ -360,6 +361,61 @@ async function checkTools(args) {
   if (!list.length) return { error: "Pass tools: a list of repo URLs, package ids (npm/pypi), remote MCP URLs or names." };
   const [cats, arch] = await Promise.all([jget("s/cats.json"), jget("s/arch.json")]);
   return { checked: await Promise.all(list.map(x => checkOne(x, cats, arch))), note: "verdict: ok / caution / avoid. live_now = we called the remote server during this check." };
+}
+
+// ---- Stack guard (KitScout plugin, 2026-11-16): the user's INSTALLED tools, checked from our daily data (no live probes, no GitHub
+// calls) so one request can cover a whole stack within the 50-subrequest budget. The plugin sends public ids only (package names,
+// server URLs without query strings, plugin names); local "fails to start" comes from the user's own machine, never from us.
+const STACK_MAX = 10;
+async function stackOne(raw, arch) {
+  const k = keyOf(raw);
+  let hits = await lookup(k.key); if (!hits.length && k.alt) hits = await lookup(k.alt);
+  const res = { input: raw, in_kitscout: hits.length > 0 }, reasons = [];
+  let status = "ok";
+  const worse = s => { const o = { ok: 0, caution: 1, avoid: 2 }; if (o[s] > o[status]) status = s; };
+  if (hits.length) {
+    const i = hits[0], a = await meta(i), [pushed, , lstate, lat] = await extra(i);
+    if (a) {
+      Object.assign(res, { name: a[0], page: shape(a, null).page, first_party: a[7].includes("v") });
+      const d = days(pushed);
+      if (a[6] && arch && arch.includes(String(a[6]).toLowerCase())) { reasons.push("repository is archived (no longer maintained)"); worse("avoid"); }
+      if (d > 730) { reasons.push(`no code changes for ${d} days (abandoned)`); worse("avoid"); }
+      else if (d > 365) { reasons.push(`no code changes for ${d} days: may be unmaintained`); worse("caution"); }
+      if (lstate === "down" && String(a[4]).startsWith("https://")) { reasons.push(`remote server did not answer our daily check (${lat || "latest"})`); worse("caution"); }  // "auth" = answers with a sign-in request = fine
+    }
+  }
+  const npmName = (k.key && /^(@[\w.-]+\/)?[\w.-]+$/.test(k.key) && /^npm:/i.test(String(raw).trim())) ? k.key : null;
+  if (npmName) {
+    const r = await fetch("https://registry.npmjs.org/" + npmName.replace("/", "%2f") + "/latest", { cf: { cacheTtl: 3600 } }).catch(() => null);
+    const j = r && r.ok ? await r.json().catch(() => null) : null;
+    if (j && j.deprecated) {
+      const dep = String(j.deprecated).slice(0, 200), mv = dep.match(/\b(?:moved|renamed|migrated|published)\s+(?:to|as)\s+(@?[\w.-]+(?:\/[\w.-]+)?)/i);
+      if (mv && !/retired|unsupported|unmaintained|no longer|archived/i.test(dep)) { reasons.push(`package moved: use ${mv[1].replace(/[.]+$/, "")} instead`); worse("caution"); }
+      else { reasons.push("npm package is deprecated by its maker: " + dep); worse("avoid"); }
+    }
+    if (j && !res.name) res.name = j.name;
+  }
+  res.verdict = status; res.reasons = reasons;
+  return res;
+}
+async function stack(req, env, ctx) {
+  let b = {}; try { b = await req.json(); } catch {}
+  const list = (Array.isArray(b.tools) ? b.tools : []).map(x => String(x || "").trim().slice(0, 200)).filter(Boolean).slice(0, STACK_MAX);
+  if (!list.length) return Response.json({ error: "Pass tools: a list of package ids (npm:, pypi:), remote MCP URLs or plugin names (max " + STACK_MAX + " per request)." }, { status: 400, headers: CORS });
+  const arch = await jget("s/arch.json");
+  const checked = await Promise.all(list.map(x => stackOne(x, arch).catch(() => ({ input: x, verdict: "ok", reasons: [], error: "check failed" }))));
+  const params = { clientInfo: { name: String(b.client || "kitscout-plugin").slice(0, 40) } };
+  logRow(env, ctx, req, "tools/call", { ...params, name: "stack", arguments: { tools: list } }, { checked });
+  return Response.json({ checked, note: "From KitScout's daily data. Details and alternatives: ask your agent to run check_tools on any flagged tool." }, { headers: CORS });
+}
+// Opt-in crowd health (plugin setting share_health): did each tool start on the user's machine today. No ids of people or machines.
+async function health(req, env) {
+  let b = {}; try { b = await req.json(); } catch {}
+  const rows = (Array.isArray(b.results) ? b.results : []).slice(0, 50).map(r => [String(r.tool || "").slice(0, 200), ["ok", "fail", "auth"].includes(r.status) ? r.status : null]).filter(r => r[0] && r[1]);
+  if (!rows.length || !env || !env.LOG) return new Response(null, { status: 204, headers: CORS });
+  const day = new Date().toISOString().slice(0, 10), client = String(b.client || "").slice(0, 40), cc = (req.cf && req.cf.country) || "";
+  await env.LOG.batch(rows.map(([t, s]) => env.LOG.prepare("INSERT INTO health (day, tool, status, client, country) VALUES (?,?,?,?,?)").bind(day, t, s, client, cc))).catch(() => {});
+  return new Response(null, { status: 204, headers: CORS });
 }
 
 // ---- Free key + watch list (kitscout.dev/watch). Key itself is never stored: only sha256 (khash) and its first 12 hex (kid).
@@ -532,6 +588,8 @@ export default {
     const url = new URL(req.url);
     if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
     if (url.pathname === "/signup" && req.method === "POST") return signup(req, env);
+    if (url.pathname === "/stack" && req.method === "POST") return stack(req, env, ctx);
+    if (url.pathname === "/health" && req.method === "POST") return health(req, env);
     if (url.pathname !== "/mcp") return new Response(LANDING, { headers: { "content-type": "text/html; charset=utf-8" } });
     if (req.method === "GET") return new Response("Use POST (Streamable HTTP, JSON responses).", { status: 405, headers: { Allow: "POST", ...CORS } });
     if (req.method !== "POST") return new Response(null, { status: 405, headers: CORS });
