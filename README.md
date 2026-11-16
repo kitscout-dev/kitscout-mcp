@@ -32,6 +32,10 @@ Endpoint: `https://mcp.kitscout.dev/mcp` (Streamable HTTP, free, no API key need
 
 Try: *"Is `@modelcontextprotocol/server-postgres` still OK to install?"* or *"I want a Slack message whenever a Jira issue is closed. Find and check tools for each step with KitScout."*
 
+## Stack guard endpoint
+
+`POST https://mcp.kitscout.dev/stack` with `{"tools": ["npm:pkg", "pypi:pkg", "https://server/mcp", "plugin:name@marketplace"]}` (max 10) returns a verdict per installed tool from KitScout's daily data (archived, npm deprecation, abandoned, remote down). Used by the [KitScout Claude Code plugin](https://github.com/kitscout-dev/kitscout-plugin) at session start. `POST /health` takes opt-in anonymous "did it start" reports.
+
 ## Privacy
 
 We keep a log of calls (time to the minute, country code, client app name, what was searched or checked, and the results; with a free key, a short key id) to learn which tools agents need. No IP addresses, headers or file contents. Free-key signups store an email (alerts only) and a hash of the key, never the key. Policy: https://kitscout.dev/privacy

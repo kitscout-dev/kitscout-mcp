@@ -34,3 +34,14 @@ CREATE TABLE IF NOT EXISTS watch (
   added TEXT, checked TEXT,
   PRIMARY KEY (kid, tool)
 );
+
+-- Opt-in crowd health from the KitScout plugin: did a tool start on a user's machine (one row per tool per report). No user/machine ids.
+CREATE TABLE IF NOT EXISTS health (
+  id INTEGER PRIMARY KEY,
+  day TEXT NOT NULL,      -- UTC date
+  tool TEXT NOT NULL,     -- public id: npm:pkg, pypi:pkg, server URL without query, plugin name
+  status TEXT NOT NULL,   -- ok | fail | auth
+  client TEXT,            -- e.g. kitscout-plugin/1.1.0
+  country TEXT
+);
+CREATE INDEX IF NOT EXISTS health_tool ON health (tool, day);
