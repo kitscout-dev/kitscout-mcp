@@ -7,7 +7,7 @@ const CH = 500;
 const KIND = { 0: "skill", 1: "mcp", 2: "plugin" };
 const TAG = { v: "first_party", o: "verified_publisher", l: "live", f: "free_to_try" };
 const INSTRUCTIONS = `KitScout indexes ~88,000 AI agent tools: MCP servers (official MCP Registry and GitHub), Agent Skills (GitHub SKILL.md) and Claude Code plugins, with GitHub activity, publisher identity and a daily live check of every remote MCP server (live = answers, some need sign-in; free_to_try = a read-only call worked with no API key).
-Tools: search_tools finds tools by product or task keywords; get_tool returns details, install or connect lines and a remote server's tool list; check_tools verifies tools the user already has in mind (maker, maintenance, adoption, live status, alternatives); list_categories lists categories; watchlist shows the user's watched tools (with a free key from kitscout.dev/watch, tools passed to check_tools are watched and the user gets an email when one is renamed, archived, deprecated or stops answering). first_party = made by the product's own maker; verified_publisher = domain-verified publisher. Stars for Agent Skills are their repo's stars.`;
+Tools: search_tools finds tools by product or task keywords; get_tool returns details, install or connect lines and a remote server's tool list; check_tools verifies tools the user already has in mind (maker, maintenance, adoption, live status, alternatives); list_categories lists categories. first_party = made by the product's own maker; verified_publisher = domain-verified publisher. Stars for Agent Skills are their repo's stars.`;
 
 // every index file is fetched with ?v=<build id> so a daily rebuild never mixes old shards with new meta (indices shift between builds)
 let VER = { v: "", at: 0 };
@@ -555,10 +555,10 @@ async function handle(msg, req, env, ctx, kid, via) {
   if (method === "initialize") {
     const v = VERSIONS.includes(params.protocolVersion) ? params.protocolVersion : VERSIONS[1];
     logRow(env, ctx, req, method, params, null, kid);
-    return ok({ protocolVersion: v, capabilities: { tools: { listChanged: false } }, serverInfo: { name: "kitscout", title: "KitScout", version: "1.0.0", websiteUrl: SITE }, instructions: INSTRUCTIONS });
+    return ok({ protocolVersion: v, capabilities: { tools: { listChanged: false } }, serverInfo: { name: "kitscout", title: "KitScout", version: "1.0.2", websiteUrl: SITE, icons: [{ src: SITE + "icon.png", mimeType: "image/png", sizes: ["500x500"] }, { src: SITE + "favicon.svg", mimeType: "image/svg+xml", sizes: ["any"] }] }, instructions: INSTRUCTIONS });
   }
   if (method === "ping") return ok({});
-  if (method === "tools/list") return ok({ tools: TOOLS });
+  if (method === "tools/list") return ok({ tools: kid ? TOOLS : TOOLS.filter(x => x.name !== "watchlist") });  // email watch list: key holders only (sign-ups paused until alerts ship)
   if (method === "tools/call") {
     const fn = { search_tools: searchTools, get_tool: getTool, check_tools: checkTools, list_categories: listCategories, watchlist: a => watchlist(a, env, kid, via) }[params.name];
     if (!fn) return err(-32602, "Unknown tool: " + params.name);
@@ -567,7 +567,7 @@ async function handle(msg, req, env, ctx, kid, via) {
       if (params.name === "check_tools" && data.checked) {
         if (kid) data.watchlist = { ...(await watchAdd(env, kid, data.checked.map(c => ({ tool: c.name || c.input, verdict: c.verdict })))),
           note: "Watched: we email you if any of these is renamed, archived, deprecated or stops answering." };
-        else data.watch_hint = `Want an email when any of these tools is renamed, archived, deprecated or goes down? Free key: ${WATCH_URL}`;
+        else data.watch_hint = `Using Claude Code? The free KitScout plugin warns at session start when any installed tool fails to start, is archived, deprecated or down: ${WATCH_URL}`;
       }
       logRow(env, ctx, req, method, params, Array.isArray(data) ? null : data, kid);
       return ok({ content: [{ type: "text", text: JSON.stringify(data, null, 1) }], structuredContent: Array.isArray(data) ? { categories: data } : data, isError: !!data.error });
@@ -584,8 +584,8 @@ const LANDING = `<!doctype html><meta charset="utf-8"><meta name="viewport" cont
 <h1>KitScout MCP server</h1><p>Lets your AI agent search ~88,000 MCP servers, Agent Skills and Claude Code plugins on <a href="${SITE}">kitscout.dev</a>, with live checks and install lines. Free, read-only, no key.</p>
 <p><b>Claude Code:</b> <code>claude mcp add --transport http kitscout https://mcp.kitscout.dev/mcp</code></p>
 <p><b>Claude app:</b> Settings → Connectors → Add custom connector → <code>https://mcp.kitscout.dev/mcp</code></p>
-<p>Tools: check_tools, search_tools, get_tool, list_categories, watchlist. Contact: contact@kitscout.dev</p>
-<p><b>Optional free key:</b> <a href="${WATCH_URL}">get one</a> and connect with <code>https://mcp.kitscout.dev/mcp?key=&lt;key&gt;</code>. Every tool you check is then watched, and we email you when one is renamed, archived, deprecated or stops answering.</p>
+<p>Tools: check_tools, search_tools, get_tool, list_categories. Contact: contact@kitscout.dev</p>
+<p><b>Claude Code:</b> the free KitScout plugin also warns you at session start when an installed tool breaks. <a href="${WATCH_URL}">How it works</a></p>
 <p>Privacy: we keep a log of calls (keywords, results, country, client app name; with a key, a short key id) to learn which tools agents need. No IPs or file contents. <a href="${SITE}privacy">Data policy</a></p>`;
 
 export default {
