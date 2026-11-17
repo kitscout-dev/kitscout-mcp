@@ -104,7 +104,9 @@ async function rank(q0) {
   const B = (await jget("s/b.json")) || {}, vb = new Set(T.flatMap(([t, o]) => [...(B[t] || []), ...(B[o] || [])]));
   // full +8 only for the maker's flagship tools; its minor tools (3-star CLI) get +1 so a popular community tool can stay above them ('jira')
   const bmax = Math.max(0, ...R.filter(r => vb.has(r.i)).map(r => (r.c >> 5) & 15));
-  for (const r of R) { if (vb.has(r.i)) { r.s += ((r.c >> 5) & 15) >= bmax - 4 ? 8 : 1; r.vb = true; } if (prefFree && (r.c & 1)) r.s += 2; }  // c bit 0 = worked without an API key
+  // 'html to pdf': a tool whose NAME has both ends of an 'A to B' query is a converter for it (+8; a global name boost was tested and hurt, round 6)
+  const dm = q.match(/([a-z0-9]+)[\s_-]+(?:to|2|into)[\s_-]+([a-z0-9]+)/), dq = dm && dm[1] !== dm[2] ? [st(dm[1]), st(dm[2])] : null;
+  for (const r of R) { if (vb.has(r.i)) { r.s += ((r.c >> 5) & 15) >= bmax - 4 ? 8 : 1; r.vb = true; } if (prefFree && (r.c & 1)) r.s += 2; if (dq && r.nt.has(dq[0]) && r.nt.has(dq[1])) r.s += 8; }  // c bit 0 = worked without an API key
   return R.sort((a, b) => b.s - a.s);
 }
 
@@ -182,7 +184,8 @@ async function searchTools(args) {
   for (const a of rows) {
     if (!a || out.length >= lim) continue;
     // same repo + same name = one product shipped two ways (Slack remote server + Slack plugin): one row, the other install line as also_install
-    const twin = out.find(b => a[6] && b[6] === a[6] && nn(b[0]) === nn(a[0]));
+    // a long identical name (>= 20 chars) is one product listed under several repos/URLs (Printwren x3, 2026-11-17)
+    const twin = out.find(b => nn(b[0]) === nn(a[0]) && ((a[6] && b[6] === a[6]) || nn(a[0]).length >= 20));
     if (twin) { if (a[4] && a[4] !== twin[4]) also.set(twin, a[4]); continue; }
     const k = a[6] || a[0]; per.set(k, (per.get(k) || 0) + 1);
     if (per.get(k) <= 2) out.push(a);
