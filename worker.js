@@ -92,13 +92,15 @@ async function rank(q0) {
     else if (mem.size) s *= 0.9;
     return { i, c: o.c, s, cov, m: mem.has(i), t: o.t, nt: o.nt || new Set() };
   });
-  const full = R.filter(r => r.cov >= 0.75 || (r.m && [...req].every(t => r.t.has(t)))); if (full.length) R = full;
   // product words are required whenever any result has them ('slack post message' must not return Telegram/LINE; dogfood 2026-11-15)
   const [CI, B0, PW] = await Promise.all([jget("s/ci.json"), jget("s/b.json"), jget("s/pw.json")]), pw = new Set(PW || []);
   const need = T.filter(([t, o]) => (B0 && (B0[t] || B0[o])) || pw.has(t) || ((CI && (CI.t[t] || CI.t[o])) || [0, 0, 0])[2] >= 0.4).map(([t]) => t);
   if (need.length && T.length > need.length) { const bm = t => new Set((B0 && B0[t]) || []);  // the maker's own tools count even without the word in their name (jira -> Atlassian Rovo)
     // platform words must be in the NAME (a description that mentions Slack is not a Slack tool); other product words anywhere
     const R2 = R.filter(r => need.every(t => r.nt.has(t) || bm(t).has(r.i) || (!pw.has(t) && r.t.has(t)))); if (R2.length) R = R2; }
+  // (after the product-word filter, else it cut the right tools first) near-full matches first; if fewer than 10, partial matches follow below them instead of vanishing (2026-11-17: 'windows desktop app automation UI' -> 2 results)
+  const full = R.filter(r => r.cov >= 0.75 || (r.m && [...req].every(t => r.t.has(t))));
+  if (full.length >= 10) R = full; else if (full.length) { const fs = new Set(full); for (const r of R) if (!fs.has(r)) r.s -= 1000; }
   const B = (await jget("s/b.json")) || {}, vb = new Set(T.flatMap(([t, o]) => [...(B[t] || []), ...(B[o] || [])]));
   // full +8 only for the maker's flagship tools; its minor tools (3-star CLI) get +1 so a popular community tool can stay above them ('jira')
   const bmax = Math.max(0, ...R.filter(r => vb.has(r.i)).map(r => (r.c >> 5) & 15));
@@ -154,6 +156,18 @@ async function rerank(q, pool, rows, w, qw) {
   } catch (e) { return rows; }
 }
 
+// 'text to speech' must not rank speech-to-text first (2026-11-17, real query log): for an 'A to B' query, tools whose name (or, if the
+// name says neither, description) only says 'B to A' go to the bottom. Same in eval/search_eval.py and build_site.py.
+function dirDemote(q, rows, txt) {
+  const m = String(q).toLowerCase().match(/([a-z0-9]+)[\s_-]+(?:to|2|into)[\s_-]+([a-z0-9]+)/);
+  if (!m || m[1] === m[2]) return rows;
+  const norm = s => " " + String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").replace(/ (?:into|2) /g, " to ") + " ";
+  const f = ` ${m[1]} to ${m[2]} `, b = ` ${m[2]} to ${m[1]} `;
+  // tier 0 = the name says 'A to B', 1 = neutral, 2 = only says 'B to A' (stable: rerank order kept inside each tier)
+  const tier = a => { if (!a) return 1; const [n, d] = txt(a).map(norm); if (n.includes(f)) return 0; if (n.includes(b)) return 2; return d.includes(b) && !d.includes(f) ? 2 : 1; };
+  return rows.map((a, k) => [tier(a), k, a]).sort((x, y) => x[0] - y[0] || x[1] - y[1]).map(x => x[2]);
+}
+
 async function searchTools(args) {
   const q0 = String(args.query || "").slice(0, 200), lim = Math.min(Math.max(+args.limit || 10, 1), 25);
   const tr = await toEnglish(q0), q = tr || q0;
@@ -163,7 +177,7 @@ async function searchTools(args) {
   // at most 2 results per source repo (one 300-skill pack must not fill the list)
   const pool = R.slice(0, Math.max(lim * 3, 30));
   const [cats, ...rows0] = await Promise.all([jget("s/cats.json"), ...pool.map(r => meta(r.i))]);
-  const rows = await rerank(q, pool, rows0, args._rr, args._q);
+  const rows = dirDemote(q, await rerank(q, pool, rows0, args._rr, args._q), a => [a[0], a[5]]);
   const per = new Map(), out = [], also = new Map(), nn = s => String(s).toLowerCase().replace(/^.*\//, "").replace(/[^a-z0-9]+/g, "");
   for (const a of rows) {
     if (!a || out.length >= lim) continue;
@@ -257,7 +271,8 @@ async function alternativesFor(name, desc, kindCode, myBits, selfIdx, cats, only
   // 2026-11-15 workflow A/B: rank() alone returned off-topic 'alternatives' (job scraper -> kubb OpenAPI codegen). An alternative must
   // itself say it does the job: >= min(2, n) of the query words in its own name + description. No alternative beats a wrong one.
   // name words carry the job ('postgres', 'google sheets'); description words are often filler ('interacting') -> require a name word when we have one
-  const fits = m => { const t = new Set(clean(m[0] + " " + (m[5] || ""))); return nameWords.length ? nameWords.some(w => t.has(w)) : words.filter(w => t.has(w)).length >= Math.min(2, words.length); };
+  // candidate name without its registry namespace: 'io.github.tldraw/tldraw' is not a GitHub tool (2026-11-16 review: github -> tldraw)
+  const fits = m => { const t = new Set(clean(String(m[0]).replace(/^.*\//, "") + " " + (m[5] || ""))); return nameWords.length ? nameWords.some(w => t.has(w)) : words.filter(w => t.has(w)).length >= Math.min(2, words.length); };
   return metas.map((m, n) => m && fits(m) && { ...shape(m, cats), why: n < official.length ? "official: made by the product's maker" : "same job, more adopted / better maintained" })
     .filter(Boolean).filter(x => onlyOfficial ? x.why.startsWith("official") : true)
     .map(x => ({ name: x.name, why: x.why, badges: x.badges, stars: x.stars ?? x.repo_stars, install: x.install, page: x.page }));
@@ -322,6 +337,11 @@ async function checkOne(raw, cats, arch) {
     if (m) {
       const g = await ghRepo(m[1]);
       if (g && !g.missing) Object.assign(facts, { stars: g.stargazers_count, last_push_days: days(g.pushed_at), license: facts.license || (g.license && g.license.spdx_id) || null, archived: facts.archived || g.archived, repo: facts.repo || g.html_url });
+      // monorepo (2026-11-16 review: server-filesystem showed 92k = the whole modelcontextprotocol/servers repo): package lives in a
+      // sub-directory, or the repo name is not the package name -> say the stars are the repo's
+      const base = npmName.replace(/^@[^/]+\//, "").toLowerCase(), rname = m[1].split("/")[1].toLowerCase().replace(/\.git$/, "");
+      if (g && !g.missing && ((j.repository && j.repository.directory) || (!rname.includes(base) && !base.includes(rname))))
+        facts.stars_note = "GitHub stars of the whole repo, which holds several packages; not of this package alone";
     }
   }
   if (repo && arch && arch.includes(repo.toLowerCase())) facts.archived = true;
@@ -345,6 +365,11 @@ async function checkOne(raw, cats, arch) {
   if (!a && !repo && !k.url && !facts.deprecated && !npmFound) reasons.push("not found in KitScout (88k tools) — check the exact name, repo URL or package id");
   if (!res.verdict) res.verdict = (facts.archived || facts.deprecated || (liveFail && !codeInput) || facts.last_push_days > 730) ? "avoid" : reasons.length ? "caution" : "ok";
   if (res.verdict === "ok" && facts.first_party) reasons.push("made by the product's own company");
+  // MCP reference servers (modelcontextprotocol org): official, but examples by the protocol's maintainers, not a vendor product
+  if (/github\.com\/modelcontextprotocol\//i.test(String(facts.repo || "")) || /^modelcontextprotocol\//i.test(String(repo || ""))) {
+    facts.official_reference = true;
+    if (res.verdict === "ok") reasons.push("official MCP reference server from the modelcontextprotocol project (an example implementation, not a vendor product)");
+  }
   res.reasons = reasons; res.facts = facts;
   if (res.verdict !== "ok" || !facts.first_party) {
     const bits = a ? await (async () => { for (const [t] of [[String(a[0]).toLowerCase()]]) { const r = (await rank(t)).find(x => x.i === i); if (r) return (r.c >> 5) & 15; } return Math.min(15, Math.floor(Math.log10((facts.stars || 0) + 1) * 2)); })() : Math.min(15, Math.floor(Math.log10((facts.stars || 0) + 1) * 2));
@@ -360,7 +385,7 @@ async function checkTools(args) {
   const list = (Array.isArray(args.tools) ? args.tools : [args.tools]).filter(Boolean).slice(0, 5);  // Workers free plan: 50 subrequests per call
   if (!list.length) return { error: "Pass tools: a list of repo URLs, package ids (npm/pypi), remote MCP URLs or names." };
   const [cats, arch] = await Promise.all([jget("s/cats.json"), jget("s/arch.json")]);
-  return { checked: await Promise.all(list.map(x => checkOne(x, cats, arch))), note: "verdict: ok / caution / avoid. live_now = we called the remote server during this check." };
+  return { checked: await Promise.all(list.map(x => checkOne(x, cats, arch))), note: "verdict: ok / caution / avoid, from maker, maintenance, adoption and live status only. ok is not a security or code review: read the code or check the publisher before giving a tool secrets or write access. live_now = we called the remote server during this check." };
 }
 
 // ---- Stack guard (KitScout plugin, 2026-11-16): the user's INSTALLED tools, checked from our daily data (no live probes, no GitHub
@@ -508,7 +533,7 @@ const TOOLS = [
   },
   {
     name: "check_tools",
-    description: "Before installing tools you found elsewhere (web search, a README, a blog), verify them: is it the product maker's own tool, maintained (last code change, archived?), adopted (stars), does the remote server answer right now, where does your data go — with a verdict (ok / caution / avoid) and better alternatives. Pass up to 5 GitHub URLs, package ids (npm/pypi), remote MCP URLs or names per call.",
+    description: "Before installing tools you found elsewhere (web search, a README, a blog), verify them: is it the product maker's own tool, maintained (last code change, archived?), adopted (stars), does the remote server answer right now, where does your data go — with a verdict (ok / caution / avoid; not a security review) and better alternatives. Pass up to 5 GitHub URLs, package ids (npm/pypi), remote MCP URLs or names per call.",
     inputSchema: { type: "object", required: ["tools"], properties: { tools: { type: "array", items: { type: "string" }, maxItems: 5, description: "e.g. https://github.com/owner/repo, @scope/package, https://mcp.example.com/mcp" } } },
     annotations: { title: "Check tools before installing", readOnlyHint: true, openWorldHint: true },
   },
