@@ -6,8 +6,19 @@ const VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const CH = 500;
 const KIND = { 0: "skill", 1: "mcp", 2: "plugin" };
 const TAG = { v: "first_party", o: "verified_publisher", l: "live", f: "free_to_try" };
-const INSTRUCTIONS = `KitScout indexes ~88,000 AI agent tools: MCP servers (official MCP Registry and GitHub), Agent Skills (GitHub SKILL.md) and Claude Code plugins, with GitHub activity, publisher identity and a daily live check of every remote MCP server (live = answers, some need sign-in; free_to_try = a read-only call worked with no API key).
-Tools: search_tools finds tools by product or task keywords; get_tool returns details, install or connect lines and a remote server's tool list; check_tools verifies tools the user already has in mind (maker, maintenance, adoption, live status, alternatives); list_categories lists categories. first_party = made by the product's own maker; verified_publisher = domain-verified publisher. Stars for Agent Skills are their repo's stars.`;
+// Directory rule (claude.com/docs/connectors/building/review-criteria): "Describe what the tool does, and don't tell Claude how to behave."
+// Subject of every sentence = a tool. 2026-11-19 rewrite from real external sessions (Codex: check_tools on 5-URL shortlists, short keyword searches).
+const INSTRUCTIONS = `KitScout is a search index of __N__ AI agent tools: MCP servers (official MCP Registry and GitHub), Agent Skills (SKILL.md on GitHub) and Claude Code plugins. Each entry carries GitHub activity, publisher identity and, for remote MCP servers, a daily live check.
+
+- search_tools: finds tools for a product or a task from short keywords (e.g. 'postgres', 'slack post message', 'pdf extract tables'), including tools that already do single steps of a program or automation being planned (e.g. 'sap gui scripting', 'youtube upload'). A product name returns the maker's own server first.
+- check_tools: checks up to 5 tools already in mind (GitHub URLs, npm/PyPI package ids, remote MCP URLs or names) before they are installed or recommended. Verdict ok / caution / avoid from maker, maintenance, adoption and a live call to remote servers; renamed tools come with the new name, weak ones with better-adopted alternatives. A repo holding many skills is answered as one collection. Not a security review.
+- get_tool: one tool's details by exact name: install or connect lines and, for remote MCP servers, the tools the server exposes.
+- list_categories: all categories with tool counts.
+
+Labels: live = the server answered the latest daily check (some need sign-in); free_to_try = a read-only call worked with no API key; first_party = made by the product's own maker; verified_publisher = domain-verified publisher. Stars on Agent Skills are their repo's stars.`;
+
+// STAGE=stg (kitscout-mcp-stg, 2026-11-18): + goal / job focus / two-app search in search_tools, under test (eval/sim). Prod keeps INSTRUCTIONS until the sim passes.
+const INSTRUCTIONS_STG = INSTRUCTIONS.replace("A product name returns the maker's own server first.", "A product name returns the maker's own server first. An optional goal (what the user wants to get done) narrows results to that job: when a search covers clearly different jobs, results are narrowed to one job (the goal's, else the most common) and the others are named, each with its own query. When the search or goal names two apps, it returns tools that work with both plus the main tools for each app.");
 
 // every index file is fetched with ?v=<build id> so a daily rebuild never mixes old shards with new meta (indices shift between builds)
 let VER = { v: "", at: 0 };
@@ -15,10 +26,12 @@ async function ver() {
   if (Date.now() - VER.at > 60000) {
     const v = await fetch(SITE + "s/v.json", { cf: { cacheTtl: 60 } }).then(r => (r.ok ? r.json() : {})).catch(() => ({}));
     if (v.v && v.v !== VER.v) cache.clear();
-    VER = { v: v.v || VER.v, at: Date.now() };
+    VER = { v: v.v || VER.v, n: v.n || VER.n, at: Date.now() };
   }
   return VER.v;
 }
+// tool count in every text (2026-11-18: texts said 88k while the index had 90,068): rounded down to thousands, from s/v.json
+const fillN = t => { const k = Math.floor((VER.n || 90000) / 1000); return String(t).replace(/__NK__/g, "~" + k + "k").replace(/__N__/g, "~" + k.toLocaleString("en-US") + ",000"); };
 const cache = new Map();
 async function jget(path) {
   const key = path + "?v=" + (await ver());
@@ -51,6 +64,14 @@ async function intentMembers(T, sc) {
     const e = CI.t[t] || CI.t[o]; if (!e) continue;
     const idf = Math.log(CI.n / (e[0] + 1)); tot += idf;
     for (const [l2, p] of e[1]) by.set(l2, (by.get(l2) || 0) + p * idf);
+  }
+  if (!by.size) {
+    // no single word points at a category ('library documentation': both words spread out), but the tools matching ALL words
+    // may: count them in each category's top lists; a clear majority (>= 80%) = intent (2026-11-20, mirrors eval/search_eval.py)
+    const rev = new Map(); for (const [k, cs] of Object.entries(CL)) for (const c of cs) rev.set(c >>> 11, k);
+    const cnt = new Map(); let n = 0;
+    for (const [i, o] of sc) if (o.t.size === T.length && rev.has(i)) { const k = rev.get(i); cnt.set(k, (cnt.get(k) || 0) + 1); n++; }
+    if (n >= 10) { const [k, v] = [...cnt].sort((a, b) => b[1] - a[1])[0]; if (v / n >= 0.8) { by.set(Number(k), v); tot = v; } }
   }
   if (!by.size) return { mem: new Set(), req };
   const [l2, v] = [...by].sort((a, b) => b[1] - a[1])[0];
@@ -191,18 +212,112 @@ async function searchTools(args) {
     if (per.get(k) <= 2) out.push(a);
   }
   if (!R.length && /[^\x00-\x7f]/.test(q)) return { query: q0, total_matches: 0, results: [], hint: "No match. KitScout indexes English names and descriptions: retry with English keywords (product + action, e.g. 'kakaotalk message')." };
-  return { query: q0, ...(tr ? { searched_as: tr } : {}), total_matches: R.length, results: out.map(a => Object.assign(shape(a, cats), also.has(a) ? { also_install: also.get(a) } : {})) };
+  const results = out.map(a => Object.assign(shape(a, cats), also.has(a) ? { also_install: also.get(a) } : {}));
+  const base = { query: q0, ...(tr ? { searched_as: tr } : {}), total_matches: R.length, results };
+  return ENV.STAGE === "stg" && !args._nojobs ? await focusJob(q0, args, base) : base;
+}
+
+// Focus (STAGE=stg, 2026-11-19, operator: "simplicity in chaos" = choice and focus). Round 4: listing every job made answers hedge.
+// Now: if the search spans different jobs, return ONE job's tools (the one the optional goal points to, else the most common one)
+// and only name the others. Jobs come from the reviewed site chip trees (s/j/*.json), else the 70B grouping. The goal text is used
+// for this choice only and never stored (directory policy 1.E: no extraneous conversation data, even for logging).
+const VAGUE = new Set("the and for with from into that this what which tool tools agent agents good best any anything something some find works work well recommend suggest suggestion app apps way help thing things stuff cool nice useful looking get want need use using my our your claude mcp server servers connector connectors integration integrations plugin plugins skill skills option options".split(" "));
+async function jobTree(q0, rows) {
+  const k = (q0.toLowerCase().match(/[a-z0-9]+/g) || []).filter(w => w.length >= 2).map(st).join("-");
+  const t = k ? await jget(`s/j/${k}.json`) : null;
+  if (t && Array.isArray(t.j) && t.j.length >= 2) return Object.assign(t.j.map(n => ({ label: n.l, query: n.q })), { curated: true });
+  const g = await jobsFor(q0, rows.slice(0, 15));
+  return g ? g.jobs.filter(o => o.query).map(o => ({ label: o.label, query: o.query })) : null;  // 70B on the fly: focus only, never asked
+}
+// Two-app workflows (2026-11-19, sims rounds 3-6: most real goals connect two apps, e.g. Notion -> Jira; a single-app job pick could
+// never surface the other end). s/plats.json = named platforms + the apps their tools pair with most (build_site.py).
+const APP_SKIP = new Set("base linear monday box word go apple meta google chrome canvas notes mail calendar drive docs sheets maps search chat teams claude chatgpt codex cursor gemini openai anthropic python java rust typescript javascript windows macos linux android ios".split(" "));
+const APP_ALIAS = { postgres: "postgresql", pg: "postgresql", twitter: "x (twitter)", gsheets: "google sheets", "google sheet": "google sheets", ga4: "google analytics", gcal: "google calendar", gdrive: "google drive" };
+function appsIn(text, P) {
+  let t = " " + String(text || "").toLowerCase().replace(/[^a-z0-9.+# ]+/g, " ").replace(/\s+/g, " ") + " ";
+  for (const [k, v] of Object.entries(APP_ALIAS)) if (P[v]) t = t.split(" " + k + " ").join(" " + v + " ");
+  const hits = Object.keys(P).filter(k => k.length >= 3 && !APP_SKIP.has(k) && t.includes(" " + k + " ")).map(k => [t.indexOf(" " + k + " "), k]);
+  const keep = hits.filter(([, k]) => !hits.some(([, o]) => o !== k && o.includes(k)));  // 'google sheets' wins over 'sheets'
+  return [...new Set(keep.sort((x, y) => x[0] - y[0]).map(x => x[1]))];
+}
+async function workflow(q0, args, P, a, b, why, answered) {
+  const clean = { ...args, goal: undefined, _nojobs: true, _mrtr: undefined };
+  const A = P[a].n, B = P[b].n;
+  const has = (t, k, n) => t.includes(k) || t.includes(n.toLowerCase());
+  const both = r => { const t = (r.name + " " + (r.description || "")).toLowerCase(); return has(t, a, A) && has(t, b, B); };
+  const [br, ra, rb] = await Promise.all([searchTools({ ...clean, query: `${a} ${b}`, limit: 10 }), searchTools({ ...clean, query: a, limit: 3 }), searchTools({ ...clean, query: b, limit: 3 })]);
+  const bridges = (br.results || []).filter(both).slice(0, 4);
+  const seen = new Set(), results = [];
+  // each app's main tools first (an agent usually uses both together: Notion's + Atlassian's official servers); tools naming both
+  // apps are often many-app hubs, so they come after (2026-11-19 test: 'company brain'-style hubs topped notion+jira)
+  for (const r of [...(ra.results || []), ...(rb.results || []), ...bridges.slice(0, 3)]) if (!seen.has(r.name)) { seen.add(r.name); results.push(r); }
+  return { query: q0, ...(answered ? { user_answer: `Elicitation answer: during this search_tools call the client showed the user a KitScout form (MCP elicitation/create) asking "Should it work with another app too?"; the user selected "${B}". This answer came through the client, so it does not appear in the chat. Result: tools for ${A} together with ${B}.` } : {}), workflow: { apps: [A, B], why, connects_both: bridges.map(r => r.name), [A]: (ra.results || []).map(r => r.name), [B]: (rb.results || []).map(r => r.name) },
+    note: `This is a two-app job (${A} and ${B}, ${why}). results start with the main tools for each app (an agent can use one per app together); connects_both lists tools that work with both apps, often many-app hubs.`,
+    results };
+}
+async function focusJob(q0, args, base) {
+  const goal = String(args.goal || "").trim().slice(0, 500);
+  const P = (await jget("s/plats.json")) || {};
+  const apps = appsIn(q0 + " " + goal, P);
+  if (apps.length >= 2) return workflow(q0, args, P, apps[0], apps[1], "the search names both apps");
+  const app = apps[0], partners = app && P[app] ? P[app].with.slice(0, 5) : [];
+  const jobs = await jobTree(q0, base.results);
+  const hasJobs = jobs && jobs.length >= 2;
+  if (!hasJobs && !partners.length) return base;
+  let pick = 0, why = "most common use";
+  // a goal that says more than the search words is the user's intent already: never ask then (round 6: asked on a clear gmail request)
+  const qw = new Set((q0.toLowerCase().match(/[a-z0-9]+/g) || []).map(st));
+  const specific = (goal.toLowerCase().match(/[a-z0-9]+/g) || []).filter(w => w.length >= 3 && !VAGUE.has(w) && !qw.has(st(w))).length >= 2;
+  if (hasJobs && goal && ENV.AI) {
+    try {
+      const r = await ENV.AI.run("@cf/baai/bge-reranker-base", { query: goal, contexts: jobs.map(o => ({ text: o.label + ": " + o.query })) });
+      const sc = (r.response || r || []).map(x => [x.id, x.score]).sort((x, y) => y[1] - x[1]);
+      if (sc.length && (sc.length < 2 || sc[0][1] - sc[1][1] > 0.05)) { pick = sc[0][0]; why = "matches the goal"; }
+      else if (sc.length && specific) { pick = sc[0][0]; why = "closest to the goal"; }
+    } catch (e) {}
+  }
+  // one question form, only when the goal does not decide: what to do (reviewed chip tree only) + which other app, if any (pairing data)
+  const m = args._mrtr;
+  const askJob = hasJobs && jobs.curated, askWith = partners.length > 0;
+  if (m && !specific && why === "most common use" && (askJob || askWith)) {
+    const ans = m.responses && m.responses.pick;
+    if (ans) {
+      const c = ans.action === "accept" && ans.content ? ans.content : {};
+      if (c.with && c.with !== "none" && P[c.with]) return workflow(q0, args, P, app, c.with, "the user picked the other app when KitScout asked", true);
+      const k = Number(c.job);
+      if (hasJobs && k >= 0 && k < jobs.length) { pick = k; why = "the user picked it when KitScout asked which job they meant"; }
+    } else if (m.can) {
+      const name = app && P[app] ? P[app].n : q0, props = {};
+      if (askJob) props.job = { type: "string", title: "What do you want to do?", oneOf: [...jobs.slice(0, 8).map((o, k) => ({ const: String(k), title: o.label })), { const: "any", title: "Not sure: show the most common" }] };
+      if (askWith) props.with = { type: "string", title: `Should it work with another app too?`, default: "none", oneOf: [...partners.map(([k, n]) => ({ const: k, title: n })), { const: "none", title: `No, just ${name}` }] };
+      return { __input: { pick: { method: "elicitation/create", params: { mode: "form", message: `Help KitScout narrow down ${name}`, requestedSchema: { type: "object", properties: props } } } },
+        __state: btoa(encodeURIComponent(q0)) };
+    }
+  }
+  if (!hasJobs) return base;
+  const f = await searchTools({ ...args, query: jobs[pick].query, goal: undefined, _nojobs: true, _mrtr: undefined });
+  if (!f.results || f.results.length < 2) return base;
+  return { query: q0, ...(why.startsWith("the user picked") ? { user_answer: `Elicitation answer: during this search_tools call the client showed the user a KitScout form (MCP elicitation/create) asking which job they want done; the user selected "${jobs[pick].label}". This answer came through the client, so it does not appear in the chat.` } : {}),
+    focus: { job: jobs[pick].label, why, searched_as: jobs[pick].query }, total_matches: f.total_matches,
+    other_jobs: jobs.filter((o, k) => k !== pick).map(o => ({ job: o.label, query: o.query })),
+    note: `This search covers different jobs, so results are narrowed to one: ${jobs[pick].label} (${why}). other_jobs lists the rest, each with a query that returns tools for that job.`,
+    results: f.results };
 }
 
 async function getTool(args) {
   const name = String(args.name || "").trim();
   const norm = s => s.toLowerCase().replace(/[^a-z0-9]+/g, "");
-  const R = (await rank(name)).slice(0, 40);
-  const metas = await Promise.all(R.map(r => meta(r.i)));
-  let k = metas.findIndex(a => a && norm(a[0]) === norm(name));
-  if (k < 0) k = metas.findIndex(a => a && norm(a[0]).endsWith(norm(name)));
-  if (k < 0) return { error: `No tool named "${name}". Use search_tools first and pass an exact name from its results.`, close_matches: metas.filter(Boolean).slice(0, 5).map(a => a[0]) };
-  const i = R[k].i, a = metas[k];
+  // exact name first via the lookup index (2026-11-19: 'io.github.tldraw/tldraw' lost to 'GitHub' in word ranking -> daily tool Short skipped)
+  let i = -1, a = null;
+  for (const h of (await lookup(norm(name))).slice(0, 5)) { const m = await meta(h); if (m && norm(m[0]) === norm(name)) { i = h; a = m; break; } }
+  if (i < 0) {
+    const R = (await rank(name)).slice(0, 40);
+    const metas = await Promise.all(R.map(r => meta(r.i)));
+    let k = metas.findIndex(x => x && norm(x[0]) === norm(name));
+    if (k < 0) k = metas.findIndex(x => x && norm(x[0]).endsWith(norm(name)));
+    if (k < 0) return { error: `No tool named "${name}". Use search_tools first and pass an exact name from its results.`, close_matches: metas.filter(Boolean).slice(0, 5).map(x => x[0]) };
+    i = R[k].i; a = metas[k];
+  }
   const [cats, tl] = await Promise.all([jget("s/cats.json"), jget(`s/tl${Math.floor(i / CH)}.json`)]);
   const out = shape(a, cats);
   const tools = tl && tl[String(i % CH)];
@@ -295,12 +410,22 @@ async function checkOne(raw, cats, arch) {
       k2 = pick >= 0 ? pick : local >= 0 ? local : 0;
     }  // a repo URL means the code, not a third-party hosted proxy of it
     i = hits[k2]; a = ms[k2];
+    // repo holding several skills/plugins and no MCP server (2026-11-19 external Codex user: anthropics/skills -> answered 'webapp-testing',
+    // google-deepmind/science-skills -> 'literature-search-arxiv') = a collection: answer for the whole repo, name a few of its tools
+    if (k.repo && hits.length >= 2 && !ms.some(m => m && m[7].endsWith("m"))) {
+      const more = hits.length > 5 ? await Promise.all(hits.slice(5, 12).map(meta)) : [];
+      const all = [...ms, ...more].filter(Boolean), kinds = new Set(all.map(m => m[7].slice(-1)));
+      res.collection = { kind: kinds.size === 1 ? { s: "Agent Skills", p: "Claude Code plugins" }[[...kinds][0]] || "tools" : "skills and plugins",
+        count: hits.length, examples: all.slice(0, 6).map(m => m[0]),
+        note: "This repo holds several tools; the verdict is for the repo (maker, maintenance, adoption). Install only the ones you need; get_tool gives details per name." };
+    }
   }
   if (a) {
     const sh = shape(a, cats), [pushed, license, lstate, lat] = await extra(i);
-    Object.assign(res, { name: a[0], page: sh.page });
-    Object.assign(facts, { type: sh.type, category: sh.category, stars: sh.stars ?? sh.repo_stars, first_party: a[7].includes("v"), verified_publisher: a[7].includes("o"),
-      last_push_days: days(pushed), license: license || null, runs: sh.runs, install: sh.install, repo: sh.repo });
+    Object.assign(res, { name: res.collection ? k.repo : a[0], page: res.collection ? sh.repo : sh.page });
+    Object.assign(facts, { type: res.collection ? "collection" : sh.type, category: sh.category, stars: sh.stars ?? sh.repo_stars, first_party: a[7].includes("v"), verified_publisher: a[7].includes("o"),
+      last_push_days: days(pushed), license: license || null, runs: sh.runs, install: res.collection ? null : sh.install, repo: sh.repo });
+    if (res.collection) delete facts.category;
     if (lstate) facts.daily_check = `${lstate} (${lat})`;
     if (sh.install && /[{}<>]/.test(sh.install)) facts.runs = "self-hosted: the URL is a template, fill in your own host";
     else if (sh.install && sh.install.startsWith("https://")) facts.live_now = await probe(sh.install);
@@ -365,7 +490,7 @@ async function checkOne(raw, cats, arch) {
   const vettedPlugin = facts.type === "plugin" && facts.verified_publisher;  // listed in Anthropic's reviewed marketplace: stars of a tiny plugin repo say little
   if (moved) reasons.push(`package moved: use ${moved} instead`);
   if ((facts.stars ?? 0) < 10 && !facts.first_party && !facts.deprecated && !vettedPlugin && facts.stars != null) reasons.push(`little adoption (${facts.stars ?? 0} GitHub stars) and not made by the product's maker`);
-  if (!a && !repo && !k.url && !facts.deprecated && !npmFound) reasons.push("not found in KitScout (88k tools) — check the exact name, repo URL or package id");
+  if (!a && !repo && !k.url && !facts.deprecated && !npmFound) reasons.push("not found in KitScout (" + fillN("__NK__") + " tools) — check the exact name, repo URL or package id");
   if (!res.verdict) res.verdict = (facts.archived || facts.deprecated || (liveFail && !codeInput) || facts.last_push_days > 730) ? "avoid" : reasons.length ? "caution" : "ok";
   if (res.verdict === "ok" && facts.first_party) reasons.push("made by the product's own company");
   // MCP reference servers (modelcontextprotocol org): official, but examples by the protocol's maintainers, not a vendor product
@@ -374,7 +499,7 @@ async function checkOne(raw, cats, arch) {
     if (res.verdict === "ok") reasons.push("official MCP reference server from the modelcontextprotocol project (an example implementation, not a vendor product)");
   }
   res.reasons = reasons; res.facts = facts;
-  if (res.verdict !== "ok" || !facts.first_party) {
+  if ((res.verdict !== "ok" || !facts.first_party) && !res.collection) {  // a collection has no single job to find alternatives for
     const bits = a ? await (async () => { for (const [t] of [[String(a[0]).toLowerCase()]]) { const r = (await rank(t)).find(x => x.i === i); if (r) return (r.c >> 5) & 15; } return Math.min(15, Math.floor(Math.log10((facts.stars || 0) + 1) * 2)); })() : Math.min(15, Math.floor(Math.log10((facts.stars || 0) + 1) * 2));
     const kindCode = a ? ({ s: 0, m: 1, p: 2 }[a[7].slice(-1)] ?? 1) : 1;
     // ok + not first-party: only point to the maker's own tool; caution/avoid: also more adopted tools for the same job
@@ -389,6 +514,40 @@ async function checkTools(args) {
   if (!list.length) return { error: "Pass tools: a list of repo URLs, package ids (npm/pypi), remote MCP URLs or names." };
   const [cats, arch] = await Promise.all([jget("s/cats.json"), jget("s/arch.json")]);
   return { checked: await Promise.all(list.map(x => checkOne(x, cats, arch))), note: "verdict: ok / caution / avoid, from maker, maintenance, adoption and live status only. ok is not a security or code review: read the code or check the publisher before giving a tool secrets or write access. live_now = we called the remote server during this check." };
+}
+
+// ---- search_tools job grouping (STAGE=stg only, 2026-11-18). Operator design: find the user's INTENT first, broad -> narrow, any number of
+// plain options; never about install rights, data policy, environment, budget. Round 3 sim: a separate recommend_tools was called in only
+// 4/12 runs (agents call search_tools first), so the grouping lives in search_tools results. Returns data only (jobs), never instructions.
+const JOB_MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+async function llmJson(system, user, max, schema) {
+  if (!ENV.AI) return null;
+  try {
+    const r = await ENV.AI.run(JOB_MODEL, { max_tokens: max || 400, temperature: 0, ...(schema ? { response_format: { type: "json_schema", json_schema: schema } } : {}), messages: [{ role: "system", content: system }, { role: "user", content: user }] });
+    const t = r && r.response;
+    if (t && typeof t === "object") return t;
+    const m = String(t || "").match(/\{[\s\S]*\}/);
+    return m ? JSON.parse(m[0]) : null;
+  } catch (e) { return null; }
+}
+const JOB_SCHEMA = { type: "object", required: ["one_job"], properties: { one_job: { type: "boolean" }, question: { type: "string" },
+  jobs: { type: "array", items: { type: "object", required: ["label", "results", "query"], properties: { label: { type: "string" }, results: { type: "array", items: { type: "integer" } }, query: { type: "string" } } } } } };
+async function jobsFor(q0, rows) {
+  if (rows.length < 4) return null;
+  const lang = (SCRIPTS.find(([re]) => re.test(q0)) || [])[1] || "english";
+  const list = rows.map((c, k) => `${k + 1}. ${c.name} [${c.type}, ${c.category}]: ${String(c.description || "").slice(0, 150)}`).join("\n");
+  const j = await llmJson(`You group search results for AI agent tools by the job they do for the user. Given a search query and numbered results, decide whether the query already points to ONE kind of job.
+Not one job = results that fit the query do clearly different jobs and the query does not say which (e.g. "youtube": get transcripts / upload videos / read channel stats / search videos). Then list each job: 2-6 everyday words, no jargon, what the user gets done (e.g. Notion: write pages / search notes / manage task databases), never 'integrate', 'connect', 'access' or 'use MCP', as many jobs as there really are (usually 3-6), with the result numbers that do it and a narrower English search query for that job. Also write one short plain question that asks which job is wanted.
+If most results are general connectors to one product that cover its common actions, that is ONE job. Each job's query must be in English. Write the question and job labels in ${lang.toUpperCase()}. Never make jobs or questions about install rights, environment, operating system, data policy, security, budget or skill level.
+Reply JSON only, one of:
+{"one_job": true}
+{"one_job": false, "question": "...", "jobs": [{"label": "...", "results": [numbers], "query": "..."}]}`,
+    "Query: " + q0 + "\nResults:\n" + list, 600, JOB_SCHEMA);
+  if (!j || j.one_job !== false || !Array.isArray(j.jobs)) return null;
+  j.jobs = j.jobs.filter(o => o && String(o.label || "").trim());
+  if (j.jobs.length < 2) return null;
+  return { question: String(j.question || "").slice(0, 200), jobs: j.jobs.slice(0, 8).map(o => ({ label: String(o.label || "").slice(0, 80), query: String(o.query || "").slice(0, 100),
+    tools: (Array.isArray(o.results) ? o.results : []).map(n => rows[n - 1] && rows[n - 1].name).filter(Boolean).slice(0, 4) })) };
 }
 
 // ---- Stack guard (KitScout plugin, 2026-11-16): the user's INSTALLED tools, checked from our daily data (no live probes, no GitHub
@@ -435,6 +594,15 @@ async function stack(req, env, ctx) {
   const params = { clientInfo: { name: String(b.client || "kitscout-plugin").slice(0, 40) } };
   logRow(env, ctx, req, "tools/call", { ...params, name: "stack", arguments: { tools: list } }, { checked });
   return Response.json({ checked, note: "From KitScout's daily data. Details and alternatives: ask your agent to run check_tools on any flagged tool." }, { headers: CORS });
+}
+// Site search chips (kitscout.dev, 2026-11-19): sendBeacon {p: [preset search, chip label, ...]}. Short strings only; the site sends
+// labels from jobs_tree.json, never typed text (privacy page). No IPs, no ids.
+async function chip(req, env, ctx) {
+  let b = {}; try { b = JSON.parse(await req.text()); } catch {}
+  const p = (Array.isArray(b.p) ? b.p : []).slice(0, 5).map(x => String(x || "").slice(0, 60)).filter(Boolean);
+  if (p.length >= 2 && env.LOG) ctx.waitUntil(env.LOG.prepare("INSERT INTO chips (ts, country, path) VALUES (?,?,?)")
+    .bind(new Date().toISOString().slice(0, 16), (req.cf && req.cf.country) || "", JSON.stringify(p)).run().catch(() => {}));
+  return new Response(null, { status: 204, headers: CORS });
 }
 // Opt-in crowd health (plugin setting share_health): did each tool start on the user's machine today. No ids of people or machines.
 async function health(req, env) {
@@ -514,7 +682,9 @@ async function signup(req, env) {
 const TOOLS = [
   {
     name: "search_tools",
-    description: "Search ~88k AI agent tools (MCP servers, Agent Skills, Claude Code plugins) by keywords. Returns ranked matches with type, category, GitHub stars, badges (first_party = made by the product's own maker, verified_publisher, live, free_to_try), install line and KitScout page. Use short keywords: product + action, e.g. 'postgres', 'slack post message', 'pdf extract tables'.",
+    stg_props: { goal: { type: "string", description: "Optional: what the user wants to get done, in their own words (used to pick the job; not stored)" } },
+    stg_description: "Finds MCP servers, connectors, Agent Skills and Claude Code plugins for a product or task among __NK__ AI agent tools. Returns ranked matches with type, category, GitHub stars, badges (first_party = made by the product's own maker, verified_publisher, live, free_to_try), install line and KitScout page. An optional goal (what the user wants to get done, in their words) narrows the results to that job. When a search covers clearly different jobs (e.g. 'youtube': upload videos, get transcripts, read channel stats), results are narrowed to one job (the goal's, else the most common) and the other jobs are named in other_jobs, each with its own query. When the search or goal names two apps (e.g. Notion and Jira), it returns tools that connect both plus the main tools for each app. Works best with short keywords: product + action, e.g. 'postgres', 'slack post message', 'pdf extract tables'. Also finds ready-made tools for single steps of a program or automation being planned (e.g. 'sap gui scripting', 'youtube upload', 'pdf invoice extract').",
+    description: "Finds MCP servers, connectors, Agent Skills and Claude Code plugins for a product or task among __NK__ AI agent tools. Returns ranked matches with type, category, GitHub stars, badges (first_party = made by the product's own maker, verified_publisher, live, free_to_try), install line and KitScout page. Works best with short keywords: product + action, e.g. 'postgres', 'slack post message', 'pdf extract tables'. Also finds ready-made tools for single steps of a program or automation being planned (e.g. 'sap gui scripting', 'youtube upload', 'pdf invoice extract').",
     inputSchema: {
       type: "object", required: ["query"], properties: {
         query: { type: "string", description: "Keywords (product names and actions work best)" },
@@ -526,23 +696,23 @@ const TOOLS = [
         limit: { type: "integer", minimum: 1, maximum: 25, description: "Max results (default 10)" },
       },
     },
-    annotations: { title: "Search agent tools", readOnlyHint: true, openWorldHint: false },
+    annotations: { title: "Find MCP servers, skills and plugins", readOnlyHint: true, openWorldHint: false },
   },
   {
     name: "get_tool",
-    description: "Details for one KitScout tool by its exact name: description, badges, stars, repo, install or connect instructions, and for remote MCP servers the actual tool list the server exposes (from our live check).",
+    description: "Details and install or connect lines for one tool, by its exact name from search_tools: description, badges, stars, repo, how to install or connect (Claude Code command, Claude app connector steps), and for remote MCP servers the tools the server exposes (from the daily live check). An unknown name returns close matches.",
     inputSchema: { type: "object", required: ["name"], properties: { name: { type: "string", description: "Exact tool name as listed in KitScout" } } },
     annotations: { title: "Get tool details", readOnlyHint: true, openWorldHint: false },
   },
   {
     name: "check_tools",
-    description: "Before installing tools you found elsewhere (web search, a README, a blog), verify them: is it the product maker's own tool, maintained (last code change, archived?), adopted (stars), does the remote server answer right now, where does your data go — with a verdict (ok / caution / avoid; not a security review) and better alternatives. Pass up to 5 GitHub URLs, package ids (npm/pypi), remote MCP URLs or names per call.",
+    description: "Checks MCP servers, skills or plugins found elsewhere (web search, a README, a blog, an installed list) before they are installed or recommended: made by the product's maker or not, maintained (last code change, archived, deprecated), adopted (stars), whether a remote server answers right now and where data goes. Returns a verdict (ok / caution / avoid; not a security review), the new name for renamed tools and better-adopted alternatives. A repo holding several skills or plugins is answered as one collection with its count and examples. Takes up to 5 GitHub URLs, package ids (npm/pypi), remote MCP URLs or names per call.",
     inputSchema: { type: "object", required: ["tools"], properties: { tools: { type: "array", items: { type: "string" }, maxItems: 5, description: "e.g. https://github.com/owner/repo, @scope/package, https://mcp.example.com/mcp" } } },
     annotations: { title: "Check tools before installing", readOnlyHint: true, openWorldHint: true },
   },
   {
     name: "list_categories",
-    description: "All KitScout categories (id, name, group, tool count). Useful to see what kinds of tools exist before searching.",
+    description: "Lists all KitScout categories (id, name, group, tool count), to see what kinds of tools exist.",
     inputSchema: { type: "object", properties: {} },
     annotations: { title: "List categories", readOnlyHint: true, openWorldHint: false },
   },
@@ -564,34 +734,51 @@ const clientOf = (req, params) => {
 };
 function logRow(env, ctx, req, method, params, data, kid) {
   if (!env || !env.LOG) return;
-  if (new URL(req.url).searchParams.get("via") === "plugin") params = { ...params, clientInfo: { name: (clientOf(req, params) || "unknown").slice(0, 32) + "+plugin" } };
+  const tagged = new URL(req.url).searchParams.get("via");  // plugin = our Claude Code plugin; sim = our own eval/sim runs (exclude in analysis)
+  if (tagged === "plugin" || tagged === "sim") params = { ...params, clientInfo: { name: (clientOf(req, params) || "unknown").slice(0, 32) + "+" + tagged } };
   const a = (params && params.arguments) || {};
   const tool = method === "tools/call" ? String(params.name || "").slice(0, 40) : method;
   const q = String(a.query || a.name || (Array.isArray(a.tools) ? a.tools.join(" | ") : a.tools) || "").slice(0, 500);
-  const filters = ["type", "only_official", "only_live", "only_free_to_try", "limit"].filter(k => a[k] !== undefined).map(k => k + "=" + a[k]).join(",");
-  const res = data && data.results ? data.results.map(r => r.name).slice(0, 10) : data && data.checked ? data.checked.map(c => `${c.name || c.input}:${c.verdict}`) : data && data.name ? [data.name] : [];
+  const filters = ["type", "only_official", "only_live", "only_free_to_try", "limit"].filter(k => a[k] !== undefined).map(k => k + "=" + a[k]).concat(a.goal ? ["goal=1"] : [], data && data.focus ? ["job=" + data.focus.job + " (" + data.focus.why + ")"] : []).join(",").slice(0, 300);  // goal text itself is never stored
+  const res = data && data.options ? data.options.map(o => "option: " + o.label) : data && data.results ? data.results.map(r => r.name).slice(0, 10) : data && data.checked ? data.checked.map(c => `${c.name || c.input}:${c.verdict}`) : data && data.name ? [data.name] : [];
   const n = data && (data.total_matches ?? (data.error ? 0 : data.name ? 1 : null));
   ctx.waitUntil(env.LOG.prepare("INSERT INTO q (ts, country, client, tool, query, filters, n, results, kid) VALUES (?,?,?,?,?,?,?,?,?)")
     .bind(new Date().toISOString().slice(0, 16), (req.cf && req.cf.country) || "", clientOf(req, params), tool, q, filters, n ?? null, JSON.stringify(res), kid || null)
     .run().catch(() => {}));
 }
 
+const SERVER_INFO = { name: "kitscout", title: "KitScout", version: "1.0.2", websiteUrl: SITE, icons: [{ src: SITE + "icon.png", mimeType: "image/png", sizes: ["500x500"] }, { src: SITE + "favicon.svg", mimeType: "image/svg+xml", sizes: ["any"] }] };
 async function handle(msg, req, env, ctx, kid, via) {
   const { id, method, params = {} } = msg;
-  const ok = result => ({ jsonrpc: "2.0", id, result });
+  // MCP 2026-07-28 (stateless, STAGE=stg only for now): Claude Code 2.1.328 probes server/discover first, then falls back to initialize.
+  // Modern results carry resultType; elicitation uses MRTR (input_required + retry with inputResponses), so no session state is needed.
+  if (["initialize", "server/discover", "tools/list"].includes(method)) await ver();  // cold start: load the live tool count before fillN (said ~90,000 while the index had 92k)
+  const meta = (params && params._meta) || {};
+  const modern = ENV.STAGE === "stg" && (meta["io.modelcontextprotocol/protocolVersion"] === "2026-07-28" || req.headers.get("mcp-protocol-version") === "2026-07-28");
+  const ok = result => ({ jsonrpc: "2.0", id, result: modern && !result.resultType ? { resultType: "complete", ...result } : result });
+  if (modern && method === "server/discover") {
+    logRow(env, ctx, req, "initialize", { clientInfo: meta["io.modelcontextprotocol/clientInfo"] }, null, kid);
+    return ok({ supportedVersions: ["2026-07-28"], capabilities: { tools: {} }, _meta: { "io.modelcontextprotocol/serverInfo": SERVER_INFO }, instructions: fillN(INSTRUCTIONS_STG) });
+  }
   const err = (code, message) => ({ jsonrpc: "2.0", id, error: { code, message } });
   if (method === "initialize") {
     const v = VERSIONS.includes(params.protocolVersion) ? params.protocolVersion : VERSIONS[1];
     logRow(env, ctx, req, method, params, null, kid);
-    return ok({ protocolVersion: v, capabilities: { tools: { listChanged: false } }, serverInfo: { name: "kitscout", title: "KitScout", version: "1.0.2", websiteUrl: SITE, icons: [{ src: SITE + "icon.png", mimeType: "image/png", sizes: ["500x500"] }, { src: SITE + "favicon.svg", mimeType: "image/svg+xml", sizes: ["any"] }] }, instructions: INSTRUCTIONS });
+    return ok({ protocolVersion: v, capabilities: { tools: { listChanged: false } }, serverInfo: SERVER_INFO, instructions: fillN(ENV.STAGE === "stg" ? INSTRUCTIONS_STG : INSTRUCTIONS) });
   }
   if (method === "ping") return ok({});
-  if (method === "tools/list") return ok({ tools: kid ? TOOLS : TOOLS.filter(x => x.name !== "watchlist") });  // email watch list: key holders only (sign-ups paused until alerts ship)
+  if (method === "tools/list") return ok({ tools: TOOLS.filter(x => (kid || x.name !== "watchlist") && (!x.stage || ENV.STAGE === "stg")).map(({ stage, stg_description, stg_props, ...x }) => (ENV.STAGE === "stg" ? { ...x, description: fillN(stg_description || x.description), ...(stg_props ? { inputSchema: { ...x.inputSchema, properties: { ...x.inputSchema.properties, ...stg_props } } } : {}) } : { ...x, description: fillN(x.description) })) });  // email watch list: key holders only (sign-ups paused until alerts ship)
   if (method === "tools/call") {
     const fn = { search_tools: searchTools, get_tool: getTool, check_tools: checkTools, list_categories: listCategories, watchlist: a => watchlist(a, env, kid, via) }[params.name];
     if (!fn) return err(-32602, "Unknown tool: " + params.name);
     try {
-      const data = await fn(params.arguments || {});
+      const a = { ...(params.arguments || {}) };
+      if (modern && params.name === "search_tools") {  // may ask the user which job they mean (elicitation form), once per search
+        const el = (meta["io.modelcontextprotocol/clientCapabilities"] || {}).elicitation;
+        a._mrtr = { can: !!(el && (el.form || !Object.keys(el).length)), responses: params.inputResponses || null };
+      }
+      const data = await fn(a);
+      if (data && data.__input) return ok({ resultType: "input_required", inputRequests: data.__input, requestState: data.__state });
       if (params.name === "check_tools" && data.checked) {
         if (kid) data.watchlist = { ...(await watchAdd(env, kid, data.checked.map(c => ({ tool: c.name || c.input, verdict: c.verdict })))),
           note: "Watched: we email you if any of these is renamed, archived, deprecated or stops answering." };
@@ -609,7 +796,7 @@ async function handle(msg, req, env, ctx, kid, via) {
 const CORS = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "*", "Access-Control-Allow-Methods": "GET, POST, OPTIONS", "Access-Control-Expose-Headers": "Mcp-Session-Id" };
 const LANDING = `<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>KitScout MCP</title>
 <style>body{font:16px/1.6 system-ui,sans-serif;max-width:680px;margin:40px auto;padding:0 16px;color:#17332D;background:#EEF1EF}code{background:#fff;padding:2px 6px;border-radius:4px;word-break:break-all}</style>
-<h1>KitScout MCP server</h1><p>Lets your AI agent search ~88,000 MCP servers, Agent Skills and Claude Code plugins on <a href="${SITE}">kitscout.dev</a>, with live checks and install lines. Free, read-only, no key.</p>
+<h1>KitScout MCP server</h1><p>Lets your AI agent search __N__ MCP servers, Agent Skills and Claude Code plugins on <a href="${SITE}">kitscout.dev</a>, with live checks and install lines. Free, read-only, no key.</p>
 <p><b>Claude Code:</b> <code>claude mcp add --transport http kitscout https://mcp.kitscout.dev/mcp</code></p>
 <p><b>Claude app:</b> Settings → Connectors → Add custom connector → <code>https://mcp.kitscout.dev/mcp</code></p>
 <p>Tools: check_tools, search_tools, get_tool, list_categories. Contact: contact@kitscout.dev</p>
@@ -624,12 +811,16 @@ export default {
     if (url.pathname === "/signup" && req.method === "POST") return signup(req, env);
     if (url.pathname === "/stack" && req.method === "POST") return stack(req, env, ctx);
     if (url.pathname === "/health" && req.method === "POST") return health(req, env);
-    if (url.pathname !== "/mcp") return new Response(LANDING, { headers: { "content-type": "text/html; charset=utf-8" } });
+    if (url.pathname === "/chip" && req.method === "POST") return chip(req, env, ctx);
+    await ver();  // tool count for fillN (cached 60 s)
+    if (url.pathname !== "/mcp") return new Response(fillN(LANDING), { headers: { "content-type": "text/html; charset=utf-8" } });
     if (req.method === "GET") return new Response("Use POST (Streamable HTTP, JSON responses).", { status: 405, headers: { Allow: "POST", ...CORS } });
     if (req.method !== "POST") return new Response(null, { status: 405, headers: CORS });
     let body;
     try { body = await req.json(); } catch { return Response.json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "Parse error" } }, { status: 400, headers: CORS }); }
     const msgs = Array.isArray(body) ? body : [body];
+    if (env && env.STAGE === "stg") for (const m of msgs) console.log(JSON.stringify({ probe: 1, method: m && m.method, hdr: req.headers.get("mcp-protocol-version"), ua: (req.headers.get("user-agent") || "").slice(0, 40),
+      pv: m && m.params && (m.params.protocolVersion || (m.params._meta && m.params._meta["io.modelcontextprotocol/protocolVersion"])), caps: m && m.params && (m.params.capabilities || (m.params._meta && m.params._meta["io.modelcontextprotocol/clientCapabilities"])) }));  // protocol probe (stg only)
     const kid = await keyId(req, url, env), via = url.searchParams.get("via") === "plugin" ? "plugin" : null;
     const out = (await Promise.all(msgs.filter(m => m && m.id !== undefined && m.method).map(m => handle(m, req, env, ctx, kid, via))));
     if (!out.length) return new Response(null, { status: 202, headers: CORS });
