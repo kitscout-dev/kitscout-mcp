@@ -732,10 +732,12 @@ const clientOf = (req, params) => {
   const ua = req.headers.get("user-agent") || "";
   return (ua.match(/^[A-Za-z][\w.-]{0,39}(\/[\w.-]{0,15})?/) || [""])[0];  // product token only, e.g. "claude-code/2.1.0"
 };
+// who connected: ?via= (old plugin builds, eval/sim) or the X-KitScout-Via header (kitscout-lite 1.4.1+ sends 'lite': plain URL = the directory's registered connector URL; lite has no stack guard)
+function viaOf(req) { return new URL(req.url).searchParams.get("via") || (req.headers.get("x-kitscout-via") || "").slice(0, 16) || null; }
 function logRow(env, ctx, req, method, params, data, kid) {
   if (!env || !env.LOG) return;
-  const tagged = new URL(req.url).searchParams.get("via");  // plugin = our Claude Code plugin; sim = our own eval/sim runs (exclude in analysis)
-  if (tagged === "plugin" || tagged === "sim") params = { ...params, clientInfo: { name: (clientOf(req, params) || "unknown").slice(0, 32) + "+" + tagged } };
+  const tagged = viaOf(req);  // plugin = our Claude Code plugin; sim = our own eval/sim runs (exclude in analysis)
+  if (tagged === "plugin" || tagged === "lite" || tagged === "sim") params = { ...params, clientInfo: { name: (clientOf(req, params) || "unknown").slice(0, 32) + "+" + tagged } };
   const a = (params && params.arguments) || {};
   const tool = method === "tools/call" ? String(params.name || "").slice(0, 40) : method;
   const q = String(a.query || a.name || (Array.isArray(a.tools) ? a.tools.join(" | ") : a.tools) || "").slice(0, 500);
@@ -821,7 +823,7 @@ export default {
     const msgs = Array.isArray(body) ? body : [body];
     if (env && env.STAGE === "stg") for (const m of msgs) console.log(JSON.stringify({ probe: 1, method: m && m.method, hdr: req.headers.get("mcp-protocol-version"), ua: (req.headers.get("user-agent") || "").slice(0, 40),
       pv: m && m.params && (m.params.protocolVersion || (m.params._meta && m.params._meta["io.modelcontextprotocol/protocolVersion"])), caps: m && m.params && (m.params.capabilities || (m.params._meta && m.params._meta["io.modelcontextprotocol/clientCapabilities"])) }));  // protocol probe (stg only)
-    const kid = await keyId(req, url, env), via = url.searchParams.get("via") === "plugin" ? "plugin" : null;
+    const kid = await keyId(req, url, env), via = viaOf(req) === "plugin" ? "plugin" : null;
     const out = (await Promise.all(msgs.filter(m => m && m.id !== undefined && m.method).map(m => handle(m, req, env, ctx, kid, via))));
     if (!out.length) return new Response(null, { status: 202, headers: CORS });
     return Response.json(Array.isArray(body) ? out : out[0], { headers: CORS });
