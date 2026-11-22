@@ -214,6 +214,8 @@ async function searchTools(args) {
   if (!R.length && /[^\x00-\x7f]/.test(q)) return { query: q0, total_matches: 0, results: [], hint: "No match. KitScout indexes English names and descriptions: retry with English keywords (product + action, e.g. 'kakaotalk message')." };
   const results = out.map(a => Object.assign(shape(a, cats), also.has(a) ? { also_install: also.get(a) } : {}));
   const base = { query: q0, ...(tr ? { searched_as: tr } : {}), total_matches: R.length, results };
+  // zero results (real query 2026-11-20: 'realgrid'): a hint instead of a bare empty list
+  if (!R.length) base.hint = "No tool matches these words. KitScout matches tool names and descriptions: retry with fewer or more general words (the kind of tool, e.g. 'data grid' for a grid library; a product + action, e.g. 'slack post message'), or browse list_categories.";
   return ENV.STAGE === "stg" && !args._nojobs ? await focusJob(q0, args, base) : base;
 }
 
@@ -775,6 +777,12 @@ async function handle(msg, req, env, ctx, kid, via) {
     if (!fn) return err(-32602, "Unknown tool: " + params.name);
     try {
       const a = { ...(params.arguments || {}) };
+      // 2026-11-22: a broken site build left no index and every search answered 0 results, which reads as "no such tool".
+      // Index files missing -> say so (isError) instead of an empty answer.
+      if (params.name !== "watchlist" && !(await jget("s/cats.json"))) {
+        logRow(env, ctx, req, method, params, { error: "index unavailable" }, kid);
+        return ok({ content: [{ type: "text", text: "KitScout's search index is temporarily unavailable (site rebuild or network). This is not an empty result: retry in a few minutes." }], isError: true });
+      }
       if (modern && params.name === "search_tools") {  // may ask the user which job they mean (elicitation form), once per search
         const el = (meta["io.modelcontextprotocol/clientCapabilities"] || {}).elicitation;
         a._mrtr = { can: !!(el && (el.form || !Object.keys(el).length)), responses: params.inputResponses || null };
