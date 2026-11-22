@@ -813,6 +813,26 @@ const LANDING = `<!doctype html><meta charset="utf-8"><meta name="viewport" cont
 <p><b>Claude Code:</b> the free KitScout plugin also warns you at session start when an installed tool breaks. <a href="${WATCH_URL}">How it works</a></p>
 <p>Privacy: we keep a log of calls (keywords, results, country, client app name; with a key, a short key id) to learn which tools agents need. No IPs or file contents. <a href="${SITE}privacy">Data policy</a></p>`;
 
+// README badge (2026-11-22, competitor scan: Glama and skills.sh grow through badges makers embed). GET /badge?tool=<repo URL,
+// package id, remote URL or name>. Same verdict as check_tools, cached 24 h at the edge. Makers link it to their KitScout page.
+async function badge(req, ctx) {
+  const url = new URL(req.url), raw = String(url.searchParams.get("tool") || "").slice(0, 300);
+  const cache = caches.default, key = new Request("https://mcp.kitscout.dev/badge?tool=" + encodeURIComponent(raw));
+  const hit = await cache.match(key); if (hit) return hit;
+  let v = "unknown";
+  if (raw) {
+    try { const [cats, arch] = await Promise.all([jget("s/cats.json"), jget("s/arch.json")]); const r = await checkOne(raw, cats, arch); v = r.in_kitscout === false && !Object.keys(r.facts || {}).length ? "unknown" : (r.verdict || "unknown"); } catch {}
+  }
+  const [txt, col] = { ok: ["checked: ok", "#2F8A57"], caution: ["checked: caution", "#C99A0A"], avoid: ["checked: avoid", "#B8432F"] }[v] || ["not listed", "#6B7280"];
+  const lw = 70, rw = 8 + txt.length * 6.6, w = Math.round(lw + rw);
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="20" role="img" aria-label="KitScout: ${txt}"><title>KitScout: ${txt}</title>` +
+    `<rect width="${lw}" height="20" rx="3" fill="#17332D"/><rect x="${lw - 3}" width="${w - lw + 3}" height="20" rx="3" fill="${col}"/><rect x="${lw - 3}" width="3" height="20" fill="${col}"/>` +
+    `<g fill="#fff" font-family="Verdana,DejaVu Sans,sans-serif" font-size="11"><text x="8" y="14" fill="#E9B824" font-weight="bold">KitScout</text><text x="${lw + 5}" y="14">${txt}</text></g></svg>`;
+  const res = new Response(svg, { headers: { "content-type": "image/svg+xml; charset=utf-8", "cache-control": "public, max-age=86400", ...CORS } });
+  if (raw) ctx.waitUntil(cache.put(key, res.clone()));
+  return res;
+}
+
 export default {
   async fetch(req, env, ctx) {
     ENV = env || {};
@@ -822,6 +842,7 @@ export default {
     if (url.pathname === "/stack" && req.method === "POST") return stack(req, env, ctx);
     if (url.pathname === "/health" && req.method === "POST") return health(req, env);
     if (url.pathname === "/chip" && req.method === "POST") return chip(req, env, ctx);
+    if (url.pathname === "/badge" && (req.method === "GET" || req.method === "HEAD")) return badge(req, ctx);
     await ver();  // tool count for fillN (cached 60 s)
     if (url.pathname !== "/mcp") return new Response(fillN(LANDING), { headers: { "content-type": "text/html; charset=utf-8" } });
     if (req.method === "GET") return new Response("Use POST (Streamable HTTP, JSON responses).", { status: 405, headers: { Allow: "POST", ...CORS } });
