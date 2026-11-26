@@ -2,9 +2,10 @@
 
 [![MCP Registry](https://img.shields.io/badge/MCP%20Registry-dev.kitscout%2Fkitscout-17332D)](https://registry.modelcontextprotocol.io/v0/servers?search=dev.kitscout)
 [![Endpoint](https://img.shields.io/badge/endpoint-mcp.kitscout.dev%2Fmcp-E9B824)](https://kitscout.dev/mcp)
+[![KitScout MCP connector](https://glama.ai/mcp/connectors/dev.kitscout/kitscout/badges/score.svg)](https://glama.ai/mcp/connectors/dev.kitscout/kitscout)
 [![License: MIT](https://img.shields.io/badge/license-MIT-4D6A86)](LICENSE)
 
-**Check AI agent tools before you install them.** Your agent finds MCP servers, Agent Skills and Claude Code plugins on the web; KitScout tells it which ones are deprecated, abandoned, unofficial, renamed or down, and what to use instead. Backed by an index of ~88,000 tools with publisher identity, GitHub activity and a daily live check of every remote MCP server.
+**Check AI agent tools before you install them.** Your agent finds MCP servers, Agent Skills and Claude Code plugins on the web; KitScout tells it which ones are deprecated, abandoned, unofficial, renamed or down, and what to use instead. Backed by an index of ~99,000 tools with publisher identity, GitHub activity and a daily live check of every remote MCP server.
 
 ![check_tools output: one tool to avoid, one caution with an official alternative, two ok](https://raw.githubusercontent.com/kitscout-dev/kitscout-plugin/main/assets/check-tools-demo.png)
 
